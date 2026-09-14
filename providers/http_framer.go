@@ -63,6 +63,8 @@ func (f *HTTPResponseFramer) consume(data []byte) error {
 		if err != nil || status < 100 || status > 599 {
 			return fmt.Errorf("invalid HTTP response status")
 		}
+		// Reject interim responses, including 101 protocol switches. An Upgrade
+		// header on a final response does not switch protocols (RFC 9110, 7.8).
 		if status < 200 {
 			return fmt.Errorf("interim responses and protocol upgrades are unsupported by the proof parser")
 		}
@@ -71,9 +73,6 @@ func (f *HTTPResponseFramer) consume(data []byte) error {
 		}
 		if err := f.parser.OnChunk(f.headers[:end]); err != nil {
 			return err
-		}
-		if f.parser.Response.Headers["upgrade"] != "" {
-			return fmt.Errorf("HTTP protocol upgrades are unsupported")
 		}
 		te := f.parser.Response.Headers["transfer-encoding"]
 		if value, ok := f.parser.Response.Headers["content-length"]; ok && value == "" {
