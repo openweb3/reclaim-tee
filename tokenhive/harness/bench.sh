@@ -78,9 +78,13 @@ MP_PID=$!
 wait_for_port 127.0.0.1 "$MP_PORT"
 
 echo "==> starting reverse-tunnel Hub on :$HUB_PORT (agent gate /v1/agent, tee relay /v1/relay)"
+# Serving requires a ledger and a per-job ceiling. Nothing here goes through
+# the user API (bench drives the TEE directly and the Hub is only the relay), so
+# the ledger stays idle and its commit cost stays out of the measured path.
 "$BIN/hub" -serve "127.0.0.1:$HUB_PORT" -host "127.0.0.1:$MP_PORT" \
   -tee "http://127.0.0.1:$TEE_PORT" -agent-keys "openai-sim=$AGENT_SECRET" \
-  -relay-key "$AGENT_SECRET" > "$SIM/hub.log" 2>&1 &
+  -relay-key "$AGENT_SECRET" \
+  -accounts "$SIM/ledger-bench.db" -max-job-micros 10000000 > "$SIM/hub.log" 2>&1 &
 HUB_PID=$!
 wait_for_port 127.0.0.1 "$HUB_PORT"
 

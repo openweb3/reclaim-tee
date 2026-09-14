@@ -79,9 +79,18 @@ func ratesTable(cards map[string]RateCard) map[string]RateCard {
 	return cards
 }
 
+// testSpec frames a request job. Each call mints a fresh job id, because that
+// id is the ledger's transaction id for the charge the job may become: two
+// spec() calls are two orders, and a test that wants one order twice must
+// reuse the spec it was handed.
 func testSpec(provider, model string) jobs.Spec {
+	jobID := make([]byte, jobs.JobIDLength)
+	if _, err := rand.Read(jobID); err != nil {
+		panic("testSpec: random job id: " + err.Error())
+	}
 	return jobs.Spec{
 		Version:  jobs.VersionV1,
+		JobID:    jobID,
 		Provider: provider,
 		Method:   "POST",
 		Host:     "provider.test:443",

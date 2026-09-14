@@ -89,7 +89,8 @@ type SessionOutcome struct {
 func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
-	return h.openSession(ctx, tenant, model, "", build)
+	conn, spec, _, err := h.openSession(ctx, tenant, model, "", build)
+	return conn, spec, err
 }
 
 // OpenSessionForProvider opens a streaming session to a named provider pinned
@@ -100,34 +101,45 @@ func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 func (h *Hub) OpenSessionForProvider(ctx context.Context, tenant, model, provider string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
-	return h.openSession(ctx, tenant, model, provider, build)
+	conn, spec, _, err := h.openSession(ctx, tenant, model, provider, build)
+	return conn, spec, err
 }
 
 // openSession opens a session either for the cheapest server of a model
 // (provider empty) or pinned to one named provider. It admits the tenant and,
 // on a failed open, returns the reserved share so a failed open never holds a
-// running job.
+// running job. The returned spend carries the session's in-flight slot and
+// money hold; it travels on the connection (see newFlightConn) and is
+// consumed by settle or by Close, whichever comes first.
 func (h *Hub) openSession(ctx context.Context, tenant, model, provider string,
-	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
+	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, *jobSpend, error) {
 
-	release, err := h.beginJob(tenant)
+	// The job id is minted here, before the provider is even chosen, because
+	// it names the ledger order the admission opens: the hold has to be
+	// recorded against something the settlement can quote, and the open may
+	// fall back through several providers before one answers.
+	jobID, err := newJobID()
 	if err != nil {
-		return nil, jobs.Spec{}, err
+		return nil, jobs.Spec{}, nil, err
 	}
-	conn, spec, err := h.openSessionFor(ctx, model, provider, build)
+	spend, err := h.beginJob(tenant, jobID)
+	if err != nil {
+		return nil, jobs.Spec{}, nil, err
+	}
+	conn, spec, err := h.openSessionFor(ctx, model, provider, jobID, build)
 	if err != nil {
 		// Nothing came up, so the share this admission reserved goes straight
 		// back: a failed open is not a running job and must not hold one.
-		release()
-		return nil, jobs.Spec{}, err
+		spend.release()
+		return nil, jobs.Spec{}, nil, err
 	}
-	return newFlightConn(conn, release), spec, nil
+	return newFlightConn(conn, spend), spec, spend, nil
 }
 
 // openSessionFor opens the session itself, without admitting the tenant.
 // It is split out so admission happens once, above, and so the slot it reserves
 // is still in hand when the caller decides whether the session came up.
-func (h *Hub) openSessionFor(ctx context.Context, model, provider string,
+func (h *Hub) openSessionFor(ctx context.Context, model, provider string, jobID []byte,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
 	var providers []string
@@ -147,6 +159,9 @@ func (h *Hub) openSessionFor(ctx context.Context, model, provider string,
 		if berr != nil {
 			return nil, jobs.Spec{}, fmt.Errorf("build session spec for %q: %w", p, berr)
 		}
+		// The Hub owns the job's identity: the held order, the receipt the TEE
+		// signs and the charge that follows all name this one value.
+		spec.JobID = jobID
 		spec = h.boundSession(spec)
 		spec, aerr := h.attachCredential(spec)
 		if aerr != nil {
@@ -232,15 +247,12 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 	build func(provider string) (jobs.Spec, error), link RealtimeLink) (SessionOutcome, error) {
 
 	var (
-		conn SessionConn
-		spec jobs.Spec
-		err  error
+		conn  SessionConn
+		spec  jobs.Spec
+		spend *jobSpend
+		err   error
 	)
-	if provider != "" {
-		conn, spec, err = h.OpenSessionForProvider(ctx, tenant, model, provider, build)
-	} else {
-		conn, spec, err = h.OpenSessionForModel(ctx, tenant, model, build)
-	}
+	conn, spec, spend, err = h.openSession(ctx, tenant, model, provider, build)
 	if err != nil {
 		return SessionOutcome{}, err
 	}
@@ -350,15 +362,20 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 		// to report what would have been charged.
 		return outcome, fmt.Errorf("store session receipt: %w", err)
 	}
-	// Store first, then settle: the ledger is in-memory and cannot fail, so
-	// once Put has succeeded the settlement is guaranteed to be recorded.
+	// Store first, then settle: the provider's audit record is durable before
+	// money books. The settlement is one transaction, and a ledger that cannot
+	// commit marks itself broken (refusing new jobs) rather than pretend the
+	// charge landed: the session was delivered either way, and the order id is
+	// what makes retrying the charge safe.
 	outcome.Stored = true
-	if !h.claimSettlement(receipt.Receipt.JobID) {
-		return outcome, fmt.Errorf("%w: job %x", ErrDuplicateSettlement, receipt.Receipt.JobID)
+	if !h.claimSettlement(spec.JobID) {
+		return outcome, fmt.Errorf("%w: job %x", ErrDuplicateSettlement, spec.JobID)
+	}
+	if err := spend.settle(spec.Provider, buyer, charged, commission); err != nil {
+		return outcome, err
 	}
 	h.ledger.NoteSettled(spec.Provider, charged)
 	h.ledger.NoteCommission(spec.Provider, commission)
-	h.chargeTenant(tenant, buyer)
 	return outcome, relErr
 }
 

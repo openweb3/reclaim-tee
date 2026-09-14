@@ -402,17 +402,21 @@ func modelsHandler(h *hub.Hub) http.HandlerFunc {
 // simply cannot serve the model is a 404; a market with every agent offline
 // is a 503 (the model may exist — the supply is what is down); quota
 // exhaustion and an exceeded in-flight share are both 429 (the request was
-// fine, the tenant is already asking for as much as it may), and an exhausted
-// spend budget is a 402 (refusing on price is not the same complaint as
-// refusing on rate); anything else is a 502 upstream failure.
+// fine, the tenant is already asking for as much as it may), an exhausted
+// prepaid balance is a 402 (refusing on price is not the same complaint as
+// refusing on rate), and a ledger that stopped committing is a 503
+// (the Hub is fail-closed on its own bookkeeping, not the caller's fault);
+// anything else is a 502 upstream failure.
 func apiErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, hub.ErrNoProviderForModel), errors.Is(err, hub.ErrUnknownProvider):
 		return http.StatusNotFound
 	case errors.Is(err, hub.ErrNoProvidersOnline):
 		return http.StatusServiceUnavailable
-	case errors.Is(err, hub.ErrBudgetExceeded):
+	case errors.Is(err, hub.ErrInsufficientFunds):
 		return http.StatusPaymentRequired
+	case errors.Is(err, hub.ErrAccountsBroken):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, hub.ErrQuotaExceeded), errors.Is(err, hub.ErrTooManyInflight):
 		return http.StatusTooManyRequests
 	default:

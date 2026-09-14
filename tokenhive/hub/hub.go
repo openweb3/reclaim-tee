@@ -40,11 +40,9 @@ var (
 	ErrUnknownProvider = errors.New("no rate published for provider")
 	// ErrQuotaExceeded means the tenant was refused before dispatch.
 	ErrQuotaExceeded = errors.New("tenant quota exhausted")
-	// ErrBudgetExceeded means the tenant's cumulative spend has reached the
-	// ceiling the Hub holds for it. Like the quota it is refused before
-	// dispatch, so the provider is never asked to spend a credential on a job
-	// the buyer cannot pay for.
-	ErrBudgetExceeded = errors.New("tenant budget exhausted")
+	// ErrInsufficientFunds (in accounts.go) means the tenant's prepaid
+	// balance could not cover the hold the job needs; it is likewise refused
+	// before dispatch.
 	// ErrStreamMismatch means the receipt attests bytes other than the ones
 	// the Hub forwarded. Either the Hub is lying about what it delivered or
 	// the TEE is not describing the same exchange; neither is settleable.
@@ -99,15 +97,15 @@ type Config struct {
 	// stop a credential being drained should not be on unless asked for.
 	Quota *Quota
 
-	// Budgets caps each tenant's cumulative spend, keyed by tenant, in the same
-	// micro-units as a rate card. A tenant absent from the map has no ceiling —
-	// the deliberate opt-out described on Quota — and is never tracked, so the
-	// table is bounded by what is provisioned here.
-	//
-	// It is the cumulative counterpart of MaxJobMicros: that bounds one job,
-	// this bounds the sum. Without it a seller whose card prices just under the
-	// per-job ceiling can bill a buyer indefinitely.
-	Budgets map[string]uint64
+	// Accounts is the durable money ledger the caller opened (see
+	// OpenAccounts): each buyer's prepaid balance, each seller's payable and
+	// the Hub's own commission, in one SQLite database. Nil disables billing
+	// entirely — the deliberate opt-out for one-shot CLI use, the same shape
+	// as a nil Quota. A Hub exposed to buyers must not pass nil: without
+	// accounts a buyer with no money is served for free. Enabling accounts
+	// requires MaxJobMicros: the prepaid hold is sized by the per-job
+	// ceiling, and nothing else bounds what one job can bill.
+	Accounts *Accounts
 
 	// Commission sets the fixed fraction the Hub takes over every settled
 	// charge, in basis points. 100 is 1%, 1000 is 10%, zero means the Hub takes
@@ -222,7 +220,7 @@ type Hub struct {
 	verify     func(proof.SignedReceipt) error
 	ledger     *Ledger
 	quota      *Quota
-	budget     *Budget
+	accounts   *Accounts
 	flight     *flightLimiter
 	commission CommissionRate
 	maxJob     uint64
@@ -264,13 +262,8 @@ func New(cfg Config) (*Hub, error) {
 	if ledger == nil {
 		ledger = NewLedger()
 	}
-	var budget *Budget
-	if len(cfg.Budgets) > 0 {
-		built, err := NewBudget(cfg.Budgets)
-		if err != nil {
-			return nil, err
-		}
-		budget = built
+	if cfg.Accounts != nil && cfg.MaxJobMicros == 0 {
+		return nil, ErrAccountsNeedCeiling
 	}
 	// A nil limiter admits everything, so an unconfigured Hub carries no
 	// per-tenant bookkeeping at all.
@@ -293,7 +286,7 @@ func New(cfg Config) (*Hub, error) {
 		verify:     cfg.Verify,
 		ledger:     ledger,
 		quota:      cfg.Quota,
-		budget:     budget,
+		accounts:   cfg.Accounts,
 		flight:     flight,
 		commission: CommissionRate{BasisPoints: cfg.Commission},
 		maxJob:     cfg.MaxJobMicros,
@@ -378,31 +371,17 @@ func (h *Hub) card(provider string) (RateCard, bool) {
 	return card, ok
 }
 
-// admitTenant applies the Hub's pre-dispatch controls for a tenant: the
-// cumulative budget, then the request quota.
-//
-// The budget is checked first on purpose. It is the money gate, and a tenant
-// whose budget is exhausted must not also burn a rate-limit slot — the request
-// is going to be refused either way, and consuming the slot would push the
-// tenant's next (affordable) request out of its window. Both checks run before
-// dispatch, so a refused request never consumes a ProviderSeq.
+// admitTenant applies the Hub's pre-dispatch quota for a tenant. The money
+// gate is not here: it is the prepaid hold in beginJob, taken before this
+// runs (so a tenant with no money never burns a rate-limit slot), because
+// the hold must be paired with the job's in-flight slot and settled or
+// released where the job ends. Both checks run before dispatch, so a refused
+// request never consumes a ProviderSeq.
 func (h *Hub) admitTenant(tenant string) error {
-	if h.budget != nil && !h.budget.Allow(tenant) {
-		return fmt.Errorf("%w: tenant %q", ErrBudgetExceeded, tenant)
-	}
 	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
 		return fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
 	}
 	return nil
-}
-
-// chargeTenant records a settled bill against the tenant's budget. It is called
-// exactly where the ledger settles, never where the Hub merely priced a job it
-// refused to bill: a refusal moves no money and must not consume budget.
-func (h *Hub) chargeTenant(tenant string, micros uint64) {
-	if h.budget != nil {
-		h.budget.Record(tenant, micros)
-	}
 }
 
 // attemptContext derives the per-attempt context from the caller's, bounding
@@ -437,8 +416,8 @@ type Outcome struct {
 	Stored bool
 }
 
-// Execute runs one job: check budget and quota, dispatch, verify, price,
-// settle, store.
+// Execute runs one job: hold prepaid balance and check quota, dispatch,
+// verify, price, settle, store.
 //
 // model is the Hub's own pricing key, deliberately out-of-band from the job
 // spec: the TEE only establishes and holds the provider connection, so it
@@ -446,23 +425,23 @@ type Outcome struct {
 // request to perform". The Hub selects and prices providers from the model it
 // resolved locally.
 //
-// The ordering is load-bearing in three places. Budget and quota are checked
-// before dispatch, so a refused request never consumes a ProviderSeq — if it
-// did, ordinary rate limiting would punch holes in the provider's sequence and
-// be indistinguishable from the Hub hiding executions. The receipt is verified
-// before anything is charged, so a forged receipt cannot move money. And the
-// receipt is stored before the ledger settles, so money books only when the
-// provider's audit record is durable: a store failure means the exchange did
-// not happen as far as the books are concerned, and the buyer is not charged
-// for an answer whose receipt was never kept (a retry is a fresh purchase, not
-// a double charge).
+// The ordering is load-bearing in three places. The prepaid hold and quota
+// are taken before dispatch, so a refused request never consumes a
+// ProviderSeq — if it did, ordinary rate limiting would punch holes in the
+// provider's sequence and be indistinguishable from the Hub hiding
+// executions. The receipt is verified before anything is charged, so a forged
+// receipt cannot move money. And the receipt is stored before the settlement
+// books, so money moves only when the provider's audit record is durable: a
+// store failure means the exchange did not happen as far as the books are
+// concerned, and the buyer is not charged for an answer whose receipt was
+// never kept (a retry is a fresh purchase, not a double charge).
 func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec, body []byte,
 	onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
-	release, err := h.beginJob(tenant)
+	spend, err := h.beginJob(tenant, spec.JobID)
 	if err != nil {
 		return Outcome{}, err
 	}
-	defer release()
+	defer spend.release()
 
 	card, ok := h.card(spec.Provider)
 	if !ok {
@@ -556,13 +535,15 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		// stored, so the provider can prove the gap. The normal path stores
 		// before settling; this path skips the store deliberately, not because
 		// it failed.
-		if !h.claimSettlement(res.Receipt.Receipt.JobID) {
+		if !h.claimSettlement(spec.JobID) {
 			return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
-				fmt.Errorf("%w: job %x", ErrDuplicateSettlement, res.Receipt.Receipt.JobID)
+				fmt.Errorf("%w: job %x", ErrDuplicateSettlement, spec.JobID)
+		}
+		if err := spend.settle(spec.Provider, buyer, charged, commission); err != nil {
+			return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer}, err
 		}
 		h.ledger.NoteSettled(spec.Provider, charged)
 		h.ledger.NoteCommission(spec.Provider, commission)
-		h.chargeTenant(tenant, buyer)
 		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer}, nil
 	}
 	if err := h.store.Put(spec.Provider, res.Receipt); err != nil {
@@ -573,15 +554,20 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
 			fmt.Errorf("store receipt: %w", err)
 	}
-	// Store first, then settle: the ledger is in-memory and cannot fail, so
-	// once Put has succeeded the settlement is guaranteed to be recorded.
-	if !h.claimSettlement(res.Receipt.Receipt.JobID) {
+	// Store first, then settle: the provider's audit record is durable before
+	// money books. The settlement is one transaction, and a ledger that cannot
+	// commit marks itself broken (refusing new jobs) rather than pretend the
+	// charge landed: the service was delivered either way, and the order id is
+	// what makes retrying the charge safe.
+	if !h.claimSettlement(spec.JobID) {
 		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true},
-			fmt.Errorf("%w: job %x", ErrDuplicateSettlement, res.Receipt.Receipt.JobID)
+			fmt.Errorf("%w: job %x", ErrDuplicateSettlement, spec.JobID)
+	}
+	if err := spend.settle(spec.Provider, buyer, charged, commission); err != nil {
+		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, err
 	}
 	h.ledger.NoteSettled(spec.Provider, charged)
 	h.ledger.NoteCommission(spec.Provider, commission)
-	h.chargeTenant(tenant, buyer)
 	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, nil
 }
 
@@ -590,11 +576,20 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 // settlement across a reset is no more plausible than a colliding JobID.
 const maxSettledJobs = 1 << 18
 
-// claimSettlement records that a job's receipt is being settled, returning
-// false when the same JobID was already settled by this Hub. It is the
-// defensive half of "one JobID settles exactly once": the TEE signs each job
-// once, so a second settlement of the same JobID is a broken caller or a
-// double-charge attempt, and the Hub refuses to book it twice.
+// claimSettlement records that a job is being settled, returning false when
+// the same job was already settled by this Hub.
+//
+// It is the cheap half of "one job settles exactly once": it refuses the
+// replay in memory, before the money path is entered at all. The ledger is the
+// authoritative half — its order id refuses the same charge durably, across a
+// restart and across this table's reset — so this is the fast path, not the
+// guarantee.
+//
+// The key is the job id the Hub minted (spec.JobID), which is also the ledger's
+// order id: both layers must name the same thing, or the in-memory refusal and
+// the durable one would disagree about what "the same job" is. In production
+// the TEE signs that same id into the receipt, so the receipt, the charge and
+// the order all name one job.
 func (h *Hub) claimSettlement(jobID []byte) bool {
 	h.settledMu.Lock()
 	defer h.settledMu.Unlock()
