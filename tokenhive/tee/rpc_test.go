@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 )
@@ -114,5 +115,42 @@ func TestServeExecuteBoundsTheRequestBody(t *testing.T) {
 	ServeExecute(nil, rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("at-cap body status = %d, want 400 (decode failure, not 413)", rec.Code)
+	}
+}
+
+// deadlineRecorder is an httptest.ResponseRecorder that also satisfies the
+// SetReadDeadline half of http.ResponseController, recording what the handler
+// asks the socket for.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (d *deadlineRecorder) SetReadDeadline(t time.Time) error {
+	d.deadlines = append(d.deadlines, t)
+	return nil
+}
+
+// TestServeExecuteClearsTheBodyReadDeadline pins that the bound on reading the
+// request body does not outlive the read. The deadline is set on the same
+// socket the SSE answer streams over, and net/http keeps a background read
+// armed on that socket for the whole request: a deadline left in place expires
+// under a long execution, fails that background read, and makes the server
+// cancel the request context — cutting a healthy job mid-stream for no reason
+// other than its duration. A wrapper that consumes the body before calling in
+// (a logging or metering layer, a test harness) is enough to arm it.
+func TestServeExecuteClearsTheBodyReadDeadline(t *testing.T) {
+	rec := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodPost, "/v1/execute", bytes.NewReader([]byte("not-canonical-cbor")))
+	ServeExecute(nil, rec, req)
+
+	if len(rec.deadlines) != 2 {
+		t.Fatalf("SetReadDeadline calls = %d, want 2 (one bound, one clear)", len(rec.deadlines))
+	}
+	if rec.deadlines[0].IsZero() {
+		t.Fatal("the body read was not bounded by a deadline")
+	}
+	if !rec.deadlines[1].IsZero() {
+		t.Fatalf("the read deadline was left set (%v); it would cut any execution that outlives it", rec.deadlines[1])
 	}
 }

@@ -109,8 +109,18 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 	// declared length cannot allocate unbounded memory. The read of one extra
 	// byte past the cap is what distinguishes "exactly at the cap" from "over
 	// it" without trusting Content-Length.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(executeReadTimeout))
+	//
+	// The deadline is cleared the moment the body is in hand. It belongs to the
+	// same socket the streamed response rides on, and net/http keeps a
+	// background read armed on that socket for the life of the request: left
+	// set, the deadline expires under a long execution, that background read
+	// fails, and the server cancels the request context — cutting every job
+	// that outlives the window mid-stream, however healthy it is. Bounding the
+	// read must not bound the answer.
+	control := http.NewResponseController(w)
+	_ = control.SetReadDeadline(time.Now().Add(executeReadTimeout))
 	raw, err := io.ReadAll(io.LimitReader(r.Body, MaxExecuteBody+1))
+	_ = control.SetReadDeadline(time.Time{})
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
