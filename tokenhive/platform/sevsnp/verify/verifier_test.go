@@ -1,6 +1,6 @@
 //go:build !mobile
 
-package sevsnp
+package verify
 
 import (
 	"testing"

@@ -43,7 +43,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/alicloud"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
+	sevsnpverify "github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp/verify"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/tencent"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
@@ -410,7 +410,7 @@ func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string, evClient
 	}
 	byPlatform := map[string]platform.EvidenceVerifier{
 		simulated.Platform: simulated.Verifier{},
-		platform.PlatformAWSSEVSNP: sevsnp.Verifier{
+		platform.PlatformAWSSEVSNP: sevsnpverify.Verifier{
 			ExpectedApp: expectedApp,
 		},
 		// Cloud skeleton verifiers, reserved for future support: wired so an

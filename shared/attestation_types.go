@@ -1,10 +1,14 @@
 package shared
 
+import "github.com/reclaimprotocol/reclaim-tee/shared/attestverify"
+
 // Attestation types carried across the client, TEE, and router boundaries.
 const (
-	AttestationTypeCS         = "cs"
-	AttestationTypeSEVSNP     = "sev-snp"
-	AttestationTypeSecureBoot = "secure-boot"
+	AttestationTypeCS = "cs"
+
+	// Defined by attestverify, which is what reads attestations of these types.
+	AttestationTypeSEVSNP     = attestverify.AttestationTypeSEVSNP
+	AttestationTypeSecureBoot = attestverify.AttestationTypeSecureBoot
 )
 
 // AttestationReport represents a generic attestation envelope with runtime signing key

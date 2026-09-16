@@ -1,4 +1,4 @@
-package shared
+package attestverify
 
 import (
 	"crypto/sha256"
@@ -234,6 +234,10 @@ func SelfBinaryHash() ([32]byte, error) {
 
 // spkiSha256 is a thin alias used by the RA-TLS verifier so SEV-SNP and CS
 // paths compute the SPKI hash identically.
+// SPKISHA256 is the binding between an attested key and its report: the hash a
+// verifier recomputes from the presented SubjectPublicKeyInfo.
+func SPKISHA256(spkiDER []byte) [32]byte { return spkiSha256(spkiDER) }
+
 func spkiSha256(spkiDER []byte) [32]byte {
 	return sha256.Sum256(spkiDER)
 }

@@ -1,11 +1,11 @@
-package sevsnp
+package verify
 
 import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
 
-	"github.com/reclaimprotocol/reclaim-tee/shared"
+	"github.com/reclaimprotocol/reclaim-tee/shared/attestverify"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
@@ -50,10 +50,10 @@ func (v Verifier) CheckEvidence(id platform.Identity) error {
 	// plain SEV2 evidence goes through the legacy tag.
 	var app string
 	var err error
-	if shared.IsSecureBootAttestation(id.Evidence) {
-		app, _, err = shared.VerifyCombinedSecureBootAttestation(id.Evidence, id.PublicKeyDER)
+	if attestverify.IsSecureBootAttestation(id.Evidence) {
+		app, _, err = attestverify.VerifyCombinedSecureBootAttestation(id.Evidence, id.PublicKeyDER)
 	} else {
-		app, _, err = shared.VerifyCombinedSEVSNPAttestation(id.Evidence, id.PublicKeyDER)
+		app, _, err = attestverify.VerifyCombinedSEVSNPAttestation(id.Evidence, id.PublicKeyDER)
 	}
 	if err != nil {
 		return fmt.Errorf("verify aws sev-snp evidence: %w", err)

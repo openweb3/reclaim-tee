@@ -1,4 +1,4 @@
-package shared
+package attestverify
 
 import (
 	"crypto/ecdsa"
@@ -25,10 +25,10 @@ import (
 // per cloud (GCP carries a go-tpm-tools Attestation proto; AWS carries a CBOR
 // envelope of the NitroTPM document + the SEV report).
 const (
-	snpAttestTagGCP           = 0x01
-	snpAttestTagAWS           = 0x02
-	snpAttestTagSecureBootGCP = 0x03
-	snpAttestTagSecureBootAWS = 0x04
+	snpAttestTagGCP           = SNPAttestTagGCP
+	snpAttestTagAWS           = SNPAttestTagAWS
+	snpAttestTagSecureBootGCP = SNPAttestTagSecureBootGCP
+	snpAttestTagSecureBootAWS = SNPAttestTagSecureBootAWS
 )
 
 // AWS Nitro Enclaves root CA (pinned trust anchor for the NitroTPM attestation

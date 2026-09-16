@@ -1,6 +1,6 @@
 //go:build !mobile
 
-package shared
+package attestverify
 
 import (
 	"bytes"

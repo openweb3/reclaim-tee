@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
+	sevsnpverify "github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp/verify"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
@@ -91,7 +91,7 @@ func TestAllowlistRefusesDisallowedPlatform(t *testing.T) {
 		AllowedPlatforms: []string{platform.PlatformAWSSEVSNP},
 		ByPlatform: map[string]platform.EvidenceVerifier{
 			simulated.Platform:         simulated.Verifier{},
-			platform.PlatformAWSSEVSNP: sevsnp.Verifier{},
+			platform.PlatformAWSSEVSNP: sevsnpverify.Verifier{},
 		},
 	})
 	if err != nil {

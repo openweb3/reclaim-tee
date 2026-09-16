@@ -1,4 +1,4 @@
-package shared
+package attestverify
 
 import (
 	"crypto/ecdsa"
