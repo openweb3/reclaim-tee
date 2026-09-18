@@ -71,6 +71,11 @@ type serviceRuntime struct {
 	template tee.Config
 	logger   *rootShared.Logger
 
+	// conns is the listener's half of a rotation. The signer moves to the new
+	// epoch's key; a connection that already presented the previous epoch's
+	// certificate cannot follow it, so it is retired instead.
+	conns *epochConnections
+
 	mu      sync.RWMutex
 	current *tee.Service
 }
@@ -80,7 +85,7 @@ type serviceRuntime struct {
 // and adopts, so startup is the first epoch rather than a second code path: the
 // files a rotation maintains are maintained from boot on.
 func newServiceRuntime(template tee.Config, epoch platform.Epoch, leafTLS *tls.Config, logger *rootShared.Logger) (*serviceRuntime, error) {
-	r := &serviceRuntime{template: template, logger: logger}
+	r := &serviceRuntime{template: template, logger: logger, conns: newEpochConnections()}
 	if err := r.publish(epoch, leafTLS); err != nil {
 		return nil, err
 	}
@@ -158,6 +163,10 @@ func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
 	r.mu.Lock()
 	r.current = next
 	r.mu.Unlock()
+	// Last, and only once the new service is the one handlers will reach: a
+	// connection retired before the swap could be replaced by one that still
+	// gets answered by the previous epoch, which is the state this is removing.
+	r.conns.rotate()
 	return nil
 }
 

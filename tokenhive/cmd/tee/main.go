@@ -312,7 +312,11 @@ func main() {
 		}
 		log.Printf("tee (platform=%s, includeEvidence=%t, mtls) listening on https://%s",
 			*platformName, *includeEvidence, *addr)
-		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: leafTLS}
+		// ConnState is what lets a rotation reach connections that are already
+		// up: the certificate they presented belongs to the epoch that accepted
+		// them, so they are closed once they fall idle rather than kept alive
+		// into an epoch whose receipts they can no longer be paired with.
+		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: leafTLS, ConnState: svcRuntime.conns.track}
 		log.Fatal(server.ListenAndServeTLS("", ""))
 	}
 
