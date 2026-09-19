@@ -58,11 +58,12 @@ func TestWriteChunkFrame(t *testing.T) {
 	}
 }
 
-// TestExecuteRequestRoundTrip checks the wire type survives canonical CBOR,
-// which is what makes the Hub's client and this service interchangeable.
-func TestExecuteRequestRoundTrip(t *testing.T) {
+// TestJobRoundTrip checks the wire type survives canonical CBOR, which is what
+// makes the Hub's client and this service interchangeable — and what lets one
+// job object serve both endpoints.
+func TestJobRoundTrip(t *testing.T) {
 	body := []byte(`{"model":"m","stream":true}`)
-	original := ExecuteRequest{
+	original := Job{
 		Spec: jobs.Spec{
 			Version:  jobs.VersionV1,
 			JobID:    make([]byte, jobs.JobIDLength),
@@ -79,7 +80,7 @@ func TestExecuteRequestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	decoded, err := DecodeExecuteRequest(encoded)
+	decoded, err := DecodeJob(encoded)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -88,9 +89,6 @@ func TestExecuteRequestRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(decoded.Body, original.Body) {
 		t.Errorf("body = %q, want %q", decoded.Body, original.Body)
-	}
-	if decoded.Job().Spec.Provider != original.Spec.Provider {
-		t.Error("Job() must carry the spec through")
 	}
 }
 

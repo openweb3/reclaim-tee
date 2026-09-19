@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -243,6 +244,7 @@ func (e *testEnv) spec(t *testing.T, body []byte) jobs.Spec {
 		Version:          jobs.VersionV1,
 		JobID:            randomBytes(t, jobs.JobIDLength),
 		Provider:         "openai",
+		Model:            "gpt-4o",
 		Method:           "POST",
 		Host:             "api.openai.com",
 		Path:             "/v1/chat/completions",
@@ -393,6 +395,41 @@ func TestExecuteHappyPath(t *testing.T) {
 	// provider cannot audit what rules were in force.
 	if len(result.PolicyHash) != 32 {
 		t.Fatalf("policy hash length = %d, want 32", len(result.PolicyHash))
+	}
+}
+
+// TestExecuteAttestsTheModel pins the model into the receipt. The Hub prices a
+// job — flat fee plus the model premium — by the model it declared for it, so
+// the receipt has to name that model or the charge can never be reconciled
+// against the provider's own upstream bill.
+func TestExecuteAttestsTheModel(t *testing.T) {
+	env := newTestEnv(t)
+	body := []byte(`{"model":"gpt-4o-mini"}`)
+	spec := env.spec(t, body)
+	spec.Model = "gpt-4o-mini"
+
+	result, err := env.service.Execute(context.Background(), Job{Spec: spec, Body: body}, nil)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := result.Receipt.Receipt.Model; got != "gpt-4o-mini" {
+		t.Fatalf("receipt model = %q, want %q", got, "gpt-4o-mini")
+	}
+	verifyReceipt(t, result.Receipt, spec)
+}
+
+// TestExecuteRefusesAnUnusableModelName checks the declared model is bounded and
+// control-free before any work is spent: it is signed into a receipt and written
+// to a log line, so a model that could forge structure in either must not be
+// dispatchable.
+func TestExecuteRefusesAnUnusableModelName(t *testing.T) {
+	env := newTestEnv(t)
+	body := []byte(`{"model":"gpt-4o"}`)
+	spec := env.spec(t, body)
+	spec.Model = strings.Repeat("m", jobs.MaxModelLength+1)
+
+	if _, err := env.service.Execute(context.Background(), Job{Spec: spec, Body: body}, nil); !errors.Is(err, jobs.ErrInvalidModel) {
+		t.Fatalf("error = %v, want %v", err, jobs.ErrInvalidModel)
 	}
 }
 

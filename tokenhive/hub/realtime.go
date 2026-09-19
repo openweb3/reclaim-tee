@@ -75,12 +75,6 @@ type SessionOutcome struct {
 // single byte reaches the user, so a provider whose open fails can give way to
 // the next-cheapest candidate, exactly as ExecuteForModel does for requests.
 //
-// build frames the session spec for one provider (host, path, Session flag);
-// the caller supplies it once because that framing is identical across
-// providers. The built spec's downlink cap is then tightened to the Hub's own
-// session bound (see boundSession) — the two must be the same number for a
-// capped session to reconcile.
-//
 // The tenant's in-flight share is taken here and travels with the returned
 // connection, because a session does not finish when this call returns: it runs
 // until the connection closes, holding a provider connection the whole time. A
@@ -93,7 +87,7 @@ func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 }
 
 // OpenSessionForProvider opens a streaming session to a named provider pinned
-// source, with no fallback. It mirrors ExecuteForProvider for the session path:
+// source, with no fallback. It is the session counterpart of ExecuteForProvider:
 // the buyer who asks for a specific AI source by name gets exactly that source,
 // never a substitute. The named provider must be a current server of the model,
 // otherwise the open is refused before a byte moves.
@@ -104,9 +98,14 @@ func (h *Hub) OpenSessionForProvider(ctx context.Context, tenant, model, provide
 }
 
 // openSession opens a session either for the cheapest server of a model
-// (provider empty) or pinned to one named provider. It admits the tenant and,
-// on a failed open, returns the reserved share so a failed open never holds a
-// running job.
+// (provider empty) or pinned to one named provider: admission first, then the
+// provider candidates, then the TEE.
+//
+// build frames the session spec for one provider (host, path, Session flag); the
+// caller supplies it once because that framing is identical across providers.
+// The built spec's downlink cap is then tightened to the Hub's own session bound
+// (see boundSession) — the two must be the same number for a capped session to
+// reconcile.
 func (h *Hub) openSession(ctx context.Context, tenant, model, provider string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
@@ -114,34 +113,27 @@ func (h *Hub) openSession(ctx context.Context, tenant, model, provider string,
 	if err != nil {
 		return nil, jobs.Spec{}, err
 	}
-	conn, spec, err := h.openSessionFor(ctx, model, provider, build)
+	providers, err := h.candidatesForModel(model, provider)
 	if err != nil {
 		// Nothing came up, so the share this admission reserved goes straight
 		// back: a failed open is not a running job and must not hold one.
 		release()
 		return nil, jobs.Spec{}, err
 	}
+	conn, spec, err := h.openSessionFor(ctx, model, providers, build)
+	if err != nil {
+		release()
+		return nil, jobs.Spec{}, err
+	}
 	return newFlightConn(conn, release), spec, nil
 }
 
-// openSessionFor opens the session itself, without admitting the tenant.
-// It is split out so admission happens once, above, and so the slot it reserves
-// is still in hand when the caller decides whether the session came up.
-func (h *Hub) openSessionFor(ctx context.Context, model, provider string,
+// openSessionFor opens the session on the first candidate that comes up. It
+// takes the candidate list rather than resolving it, so who may serve a model is
+// decided in one place for both planes (see candidatesForModel).
+func (h *Hub) openSessionFor(ctx context.Context, model string, providers []string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
-	var providers []string
-	if provider != "" {
-		if !h.providerServes(provider, model) {
-			return nil, jobs.Spec{}, fmt.Errorf("%w: model %q from provider %q", ErrNoProviderForModel, model, provider)
-		}
-		providers = []string{provider}
-	} else {
-		providers = h.providersForModel(model)
-		if len(providers) == 0 {
-			return nil, jobs.Spec{}, h.supplyError(model)
-		}
-	}
 	for _, p := range providers {
 		spec, berr := build(p)
 		if berr != nil {
@@ -231,16 +223,7 @@ func (h *Hub) RunRealtimeForProvider(ctx context.Context, tenant, model, provide
 func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 	build func(provider string) (jobs.Spec, error), link RealtimeLink) (SessionOutcome, error) {
 
-	var (
-		conn SessionConn
-		spec jobs.Spec
-		err  error
-	)
-	if provider != "" {
-		conn, spec, err = h.OpenSessionForProvider(ctx, tenant, model, provider, build)
-	} else {
-		conn, spec, err = h.OpenSessionForModel(ctx, tenant, model, build)
-	}
+	conn, spec, err := h.openSession(ctx, tenant, model, provider, build)
 	if err != nil {
 		return SessionOutcome{}, err
 	}
@@ -256,15 +239,8 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 	// Any expiry (wall-clock timeout or the caller's cancellation) must unwedge
 	// the relay loops, which are otherwise blocked on the tunnel: closing the
 	// tunnel aborts the downlink read so we can return and settle.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-stop:
-		}
-	}()
+	stopOnExpiry := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopOnExpiry()
 
 	up, down, downHash, relErr := relaySession(ctx, conn, link, spec.JobID,
 		h.sessionMaxUpBytes, h.sessionMaxDownBytes, h.sessionIdle)
@@ -313,52 +289,27 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 	// exactly what was relayed — and the mismatch check above bound it to the
 	// Hub's own relayed count. Pass the relayed count so pricing needs no cap
 	// special case.
-	charged, err := Price(card, model, down, rec)
+	amt, err := h.price(card, model, down, rec)
 	if err != nil {
 		return SessionOutcome{}, fmt.Errorf("price session: %w", err)
-	}
-	commission, err := h.commission.CommissionOn(charged)
-	if err != nil {
-		return SessionOutcome{}, err
-	}
-	buyer, ok := addChecked(charged, commission)
-	if !ok {
-		return SessionOutcome{}, fmt.Errorf("%w: charged %d plus commission %d", ErrPriceOverflow, charged, commission)
 	}
 	outcome := SessionOutcome{
 		Receipt:       receipt,
 		Provider:      spec.Provider,
 		UplinkBytes:   up,
 		DownlinkBytes: down,
-		Charged:       charged,
-		Commission:    commission,
-		Buyer:         buyer,
+		Charged:       amt.provider,
+		Commission:    amt.commission,
+		Buyer:         amt.buyer,
 	}
-	if h.maxJob > 0 && buyer > h.maxJob {
-		// Same policy as the request path: the exchange really happened, so
-		// the receipt is kept for the provider's audit, but a session priced
-		// above the Hub's per-job ceiling settles nothing.
-		if serr := h.store.Put(spec.Provider, receipt); serr != nil {
-			return outcome, fmt.Errorf("store session receipt: %w", serr)
-		}
-		outcome.Stored = true
-		return outcome, fmt.Errorf("%w: buyer %d exceeds %d", ErrJobPriceExceeded, buyer, h.maxJob)
+	// A session settles through the same book as a request: a session priced
+	// over the Hub's ceiling or whose receipt is not durable moves no money,
+	// and neither is booked twice. The difference is only in what report the
+	// caller is owed, so the relay error rides alongside a settled session.
+	outcome.Stored, err = h.book(tenant, spec.Provider, receipt, amt, false)
+	if err != nil {
+		return outcome, err
 	}
-	if err := h.store.Put(spec.Provider, receipt); err != nil {
-		// Same rule as the request path: the receipt is not durable, so the
-		// ledger records no money. The caller still gets the priced outcome
-		// to report what would have been charged.
-		return outcome, fmt.Errorf("store session receipt: %w", err)
-	}
-	// Store first, then settle: the ledger is in-memory and cannot fail, so
-	// once Put has succeeded the settlement is guaranteed to be recorded.
-	outcome.Stored = true
-	if !h.claimSettlement(receipt.Receipt.JobID) {
-		return outcome, fmt.Errorf("%w: job %x", ErrDuplicateSettlement, receipt.Receipt.JobID)
-	}
-	h.ledger.NoteSettled(spec.Provider, charged)
-	h.ledger.NoteCommission(spec.Provider, commission)
-	h.chargeTenant(tenant, buyer)
 	return outcome, relErr
 }
 

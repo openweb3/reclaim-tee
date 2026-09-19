@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,6 +18,7 @@ func validSpec(t *testing.T) Spec {
 		Version:          VersionV1,
 		JobID:            make([]byte, JobIDLength),
 		Provider:         "openai",
+		Model:            "gpt-4o",
 		Method:           "POST",
 		Host:             "api.openai.com",
 		Path:             "/v1/responses",
@@ -60,6 +62,7 @@ func TestHashChangesWithEveryField(t *testing.T) {
 		"version":   func(s *Spec) { s.Version = 2 },
 		"jobID":     func(s *Spec) { s.JobID[0] ^= 0xff },
 		"provider":  func(s *Spec) { s.Provider = "anthropic" },
+		"model":     func(s *Spec) { s.Model = "gpt-4o-mini" },
 		"method":    func(s *Spec) { s.Method = "GET" },
 		"host":      func(s *Spec) { s.Host = "api.anthropic.com" },
 		"path":      func(s *Spec) { s.Path = "/v1/messages" },
@@ -114,6 +117,8 @@ func TestValidateRejects(t *testing.T) {
 		{"traversal path", func(s *Spec) { s.Path = "/v1/../../admin" }, ErrInvalidPath},
 		{"path with space", func(s *Spec) { s.Path = "/v1/a b" }, ErrInvalidPath},
 		{"short body hash", func(s *Spec) { s.BodyHash = s.BodyHash[:16] }, ErrInvalidBodyHash},
+		{"unbounded model", func(s *Spec) { s.Model = strings.Repeat("m", MaxModelLength+1) }, ErrInvalidModel},
+		{"model with control character", func(s *Spec) { s.Model = "gpt\n4o" }, ErrInvalidModel},
 		{"short nonce", func(s *Spec) { s.Nonce = s.Nonce[:4] }, ErrInvalidNonce},
 		{"empty nonce", func(s *Spec) { s.Nonce = nil }, ErrInvalidNonce},
 		{"zero expiry", func(s *Spec) { s.ExpiresAt = 0 }, ErrInvalidExpiry},

@@ -43,6 +43,15 @@ import (
 // is finite.
 const defaultRequestReadTimeout = 30 * time.Second
 
+// defaultResponseWriteTimeout bounds one write back to a user. Without a write
+// deadline a client that completes its request and then stops reading fills the
+// socket's send buffer and blocks the handler forever, holding the goroutine,
+// the tenant's in-flight slot, and the provider connection behind it. The
+// deadline rolls with every write, so a slow but progressing reader is never
+// cut; it is cleared when the handler returns so a pooled connection is not left
+// carrying a spent deadline into the next request.
+const defaultResponseWriteTimeout = 30 * time.Second
+
 // serveConfig is the routing the resident service hands to the scheduler: the
 // upstream it asks the TEE to reach.
 type serveConfig struct {
@@ -262,6 +271,10 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	flusher, _ := w.(http.Flusher)
 
+	rc := http.NewResponseController(w)
+	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+	writeDeadline := func() { _ = rc.SetWriteDeadline(time.Now().Add(defaultResponseWriteTimeout)) }
+
 	// The user-visible status and headers are committed from the TEE's
 	// response-start frame, not from the first relayed byte: the Hub must know
 	// whether the upstream answered 200 or 401/429 before it shows the buyer
@@ -296,6 +309,7 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.Header().Add(name, value)
 			}
 		}
+		writeDeadline()
 		w.WriteHeader(status)
 	}
 	isSuccess := func() bool { return status >= 200 && status < 300 }
@@ -307,6 +321,7 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// re-wrapping here would emit `data: data: {…}` and break every
 		// OpenAI SDK. The Hub's only job is byte-pass-through.
 		commit(tee.Response{})
+		writeDeadline()
 		if _, werr := w.Write(chunk); werr != nil {
 			return werr
 		}
@@ -320,12 +335,12 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.Provider != "" {
 		outcome, err = c.h.ExecuteForProvider(r.Context(), tenant, req.Model, req.Provider, body,
 			func(provider string) (jobs.Spec, error) {
-				return shared.BuildSpec(provider, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
+				return shared.BuildSpec(provider, req.Model, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
 			}, onChunk, commit)
 	} else {
 		outcome, err = c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
 			func(provider string) (jobs.Spec, error) {
-				return shared.BuildSpec(provider, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
+				return shared.BuildSpec(provider, req.Model, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
 			}, onChunk, commit)
 	}
 	if !started {
@@ -351,6 +366,7 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// reported like any committed failure and the marker is withheld.
 	truncated := err == nil && isSuccess() &&
 		outcome.Receipt.Receipt.Completion != proof.CompletionComplete
+	writeDeadline()
 	if err != nil {
 		// The response is committed. For a 2xx stream the failure is reported
 		// as an SSE error frame; for a non-2xx upstream status the upstream's
@@ -374,6 +390,7 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// upstream that completed with an empty body still needs the marker,
 		// hence the commit here.
 		commit(tee.Response{})
+		writeDeadline()
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}
 	if started && flusher != nil {
@@ -632,11 +649,12 @@ func (c *sessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	build := func(provider string) (jobs.Spec, error) { return c.buildSession(req.Model, provider) }
 	var outcome hub.SessionOutcome
 	if req.Provider != "" {
-		outcome, err = c.h.RunRealtimeForProvider(r.Context(), tenant, req.Model, req.Provider, c.buildSession, &sessionLink{conn: conn, first: first})
+		outcome, err = c.h.RunRealtimeForProvider(r.Context(), tenant, req.Model, req.Provider, build, &sessionLink{conn: conn, first: first})
 	} else {
-		outcome, err = c.h.RunRealtime(r.Context(), tenant, req.Model, c.buildSession, &sessionLink{conn: conn, first: first})
+		outcome, err = c.h.RunRealtime(r.Context(), tenant, req.Model, build, &sessionLink{conn: conn, first: first})
 	}
 	log.Printf("session model=%q tenant=%q provider=%q uplink=%d downlink=%d charged=%.2f commission=%.2f buyer=%.2f err=%v",
 		req.Model, tenant, outcome.Provider, outcome.UplinkBytes, outcome.DownlinkBytes,
@@ -645,8 +663,10 @@ func (c *sessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // buildSession frames the session spec for a provider. Identical across providers
-// except the provider name, exactly as buildSpec frames request specs.
-func (c *sessionHandler) buildSession(provider string) (jobs.Spec, error) {
+// except the provider name, exactly as buildSpec frames request specs. The model
+// is the one the Hub read out of the user's first frame and routed and priced
+// on, and it is carried into the spec so the session receipt attests it.
+func (c *sessionHandler) buildSession(model, provider string) (jobs.Spec, error) {
 	jobID := make([]byte, jobs.JobIDLength)
 	if _, err := rand.Read(jobID); err != nil {
 		return jobs.Spec{}, err
@@ -659,6 +679,7 @@ func (c *sessionHandler) buildSession(provider string) (jobs.Spec, error) {
 		Version:          jobs.VersionV1,
 		JobID:            jobID,
 		Provider:         provider,
+		Model:            model,
 		Method:           "GET",
 		Host:             c.cfg.HostFor(provider),
 		Path:             realtimePath,
@@ -788,6 +809,9 @@ func (l *sessionLink) Write(p []byte) (int, error) {
 		if f.Opcode == hub.WSOpBinary {
 			msgType = websocket.BinaryMessage
 		}
+		// Roll a write deadline with every frame: a user that stops reading
+		// must not pin this goroutine — and the tunnel behind it — forever.
+		_ = l.conn.SetWriteDeadline(time.Now().Add(defaultResponseWriteTimeout))
 		if err := l.conn.WriteMessage(msgType, f.Data); err != nil {
 			return 0, err
 		}

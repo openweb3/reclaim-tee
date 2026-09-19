@@ -58,6 +58,10 @@ const (
 	MaxQueryLength  = 4096
 	MaxHostLength   = 253
 	MaxProviderName = 64
+	// MaxModelLength bounds the declared model alongside the provider name it
+	// belongs to: both are commercial keys the receipt attests, so both are
+	// bounded.
+	MaxModelLength = 64
 )
 
 // Validation errors. Callers can match these with errors.Is to map them onto
@@ -72,6 +76,7 @@ var (
 	ErrInvalidQuery       = errors.New("invalid query")
 	ErrInvalidHeaders     = errors.New("invalid headers")
 	ErrInvalidBodyHash    = errors.New("invalid body hash")
+	ErrInvalidModel       = errors.New("invalid model")
 	ErrInvalidNonce       = errors.New("invalid nonce")
 	ErrInvalidExpiry      = errors.New("invalid expiry")
 	ErrInvalidLimit       = errors.New("invalid response size limit")
@@ -112,6 +117,18 @@ type Spec struct {
 	// on its behalf); the Hub only ever relays it, and the TEE alone decrypts
 	// it. Empty means the job carries no credential, which the TEE refuses.
 	Credential []byte `cbor:"15,keyasint,omitempty"`
+
+	// Model is the model the Hub is routing and pricing this job as. The TEE
+	// never interprets it — it cannot know what a model is worth — it only
+	// echoes it into the receipt, so the model a charge was computed from is
+	// attested rather than out-of-band. Without it the provider's rate card
+	// (PerRequestMicros plus ModelPremiumMicros keyed by model) would be
+	// applied to a number the provider has no receipt-level evidence for, and
+	// the provider's only reconciliation path is a receipt that names it.
+	//
+	// Optional so that a deployment which does not price by model can omit it;
+	// every Hub code path sets it.
+	Model string `cbor:"16,keyasint,omitempty"`
 }
 
 // SupportedMethods are the HTTP methods a job may request. HEAD is excluded:
@@ -199,6 +216,9 @@ func (s Spec) Validate() error {
 	if len(s.BodyHash) != BodyHashLength {
 		return fmt.Errorf("%w: length %d, want %d", ErrInvalidBodyHash, len(s.BodyHash), BodyHashLength)
 	}
+	if err := ValidateModelName(s.Model); err != nil {
+		return err
+	}
 	if len(s.Nonce) < MinNonceLength || len(s.Nonce) > MaxNonceLength {
 		return fmt.Errorf("%w: length %d outside [%d,%d]",
 			ErrInvalidNonce, len(s.Nonce), MinNonceLength, MaxNonceLength)
@@ -232,6 +252,26 @@ func (s Spec) MatchesBody(body []byte) bool {
 		return false
 	}
 	return subtleEqual(computed[:], s.BodyHash)
+}
+
+// ValidateModelName checks the shape of a model identifier. It accepts any
+// non-empty printable string up to MaxModelLength: model IDs are opaque and
+// vendor-chosen ("gpt-4o-mini", "claude-sonnet-4"), so the only properties
+// that matter are that the value is bounded and carries no control character,
+// which would let it forge structure in a receipt or a log line.
+func ValidateModelName(model string) error {
+	if model == "" {
+		return nil
+	}
+	if len(model) > MaxModelLength {
+		return fmt.Errorf("%w: %q exceeds %d bytes", ErrInvalidModel, model, MaxModelLength)
+	}
+	for _, r := range model {
+		if r <= ' ' || r == '\x7f' {
+			return fmt.Errorf("%w: %q contains a control character", ErrInvalidModel, model)
+		}
+	}
+	return nil
 }
 
 // ValidateProviderName checks the shape of a provider identifier.

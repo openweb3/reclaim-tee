@@ -506,17 +506,21 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	defer cancel()
 
 	res, err := h.tee.Execute(ctx, spec, body, onChunk, onStart...)
+	// Everything from here on reports on the same exchange, so the outcome is
+	// built once and each refusal fills in what it knows: what the caller was
+	// shown, and the receipt if one arrived.
+	outcome := Outcome{Chunks: res.Chunks, StatusCode: res.Status}
 	if err != nil {
-		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, err
+		return outcome, err
 	}
 
 	if err := h.verify(res.Receipt); err != nil {
-		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, fmt.Errorf("verify receipt: %w", err)
+		return outcome, fmt.Errorf("verify receipt: %w", err)
 	}
 	h.ledger.NoteVerified(spec.Provider)
 
 	if !res.Receipt.Receipt.MatchesStream(res.Chunks) {
-		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, ErrStreamMismatch
+		return outcome, ErrStreamMismatch
 	}
 
 	// The response start the Hub acted on must be the exchange the receipt
@@ -528,7 +532,7 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	// frame was observed, since body chunks committed under a default 200
 	// would then settle against a receipt attesting a real 401.
 	if !receiptMatchesStart(res.Receipt.Receipt, res.Status, res.Headers) {
-		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, ErrResponseStartMismatch
+		return outcome, ErrResponseStartMismatch
 	}
 
 	// Price by the bytes actually relayed, not by the job's cap: the TEE
@@ -541,67 +545,17 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	for _, chunk := range res.Chunks {
 		relayed += uint64(len(chunk))
 	}
-	charged, err := Price(card, model, relayed, res.Receipt.Receipt)
+	amt, err := h.price(card, model, relayed, res.Receipt.Receipt)
 	if err != nil {
-		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, err
+		return outcome, err
 	}
-	commission, err := h.commission.CommissionOn(charged)
-	if err != nil {
-		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, err
-	}
-	buyer, ok := addChecked(charged, commission)
-	if !ok {
-		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, fmt.Errorf("%w: charged %d plus commission %d",
-			ErrPriceOverflow, charged, commission)
-	}
-	if h.maxJob > 0 && buyer > h.maxJob {
-		// The buyer would be billed more than the Hub's per-job ceiling. The
-		// exchange really happened, so its receipt is kept — the provider must
-		// still be able to audit every use of its credential, and a hole in
-		// the sequence would read as a hidden execution — but nothing moves:
-		// no charge, no commission, no settlement. The caller gets the priced
-		// outcome so it can show what was refused.
-		if serr := h.store.Put(spec.Provider, res.Receipt); serr != nil {
-			return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
-				fmt.Errorf("store receipt: %w", serr)
-		}
-		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true},
-			fmt.Errorf("%w: buyer %d exceeds %d", ErrJobPriceExceeded, buyer, h.maxJob)
-	}
-	seq := res.Receipt.Receipt.ProviderSeq
-	if h.withhold != nil && h.withhold(seq) {
-		// A withheld receipt is the test seam for a Hub that hides an
-		// execution: it is settled (the ledger records the charge) but never
-		// stored, so the provider can prove the gap. The normal path stores
-		// before settling; this path skips the store deliberately, not because
-		// it failed.
-		if !h.claimSettlement(res.Receipt.Receipt.JobID) {
-			return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
-				fmt.Errorf("%w: job %x", ErrDuplicateSettlement, res.Receipt.Receipt.JobID)
-		}
-		h.ledger.NoteSettled(spec.Provider, charged)
-		h.ledger.NoteCommission(spec.Provider, commission)
-		h.chargeTenant(tenant, buyer)
-		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer}, nil
-	}
-	if err := h.store.Put(spec.Provider, res.Receipt); err != nil {
-		// The receipt is not durable, so nothing is charged: the ledger is the
-		// record of money that moved, and money must not move without the
-		// provider's audit record behind it. The caller still receives the
-		// priced outcome so it can report what would have been charged.
-		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
-			fmt.Errorf("store receipt: %w", err)
-	}
-	// Store first, then settle: the ledger is in-memory and cannot fail, so
-	// once Put has succeeded the settlement is guaranteed to be recorded.
-	if !h.claimSettlement(res.Receipt.Receipt.JobID) {
-		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true},
-			fmt.Errorf("%w: job %x", ErrDuplicateSettlement, res.Receipt.Receipt.JobID)
-	}
-	h.ledger.NoteSettled(spec.Provider, charged)
-	h.ledger.NoteCommission(spec.Provider, commission)
-	h.chargeTenant(tenant, buyer)
-	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, nil
+	outcome.Receipt = res.Receipt
+	outcome.Charged = amt.provider
+	outcome.Commission = amt.commission
+	outcome.Buyer = amt.buyer
+	outcome.Stored, err = h.book(tenant, spec.Provider, res.Receipt, amt,
+		h.withhold != nil && h.withhold(res.Receipt.Receipt.ProviderSeq))
+	return outcome, err
 }
 
 // maxSettledJobs caps the in-memory dedup table. Beyond it the table is reset

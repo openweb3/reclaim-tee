@@ -561,6 +561,43 @@ func TestAgentRequiresConfig(t *testing.T) {
 	}
 }
 
+// TestAgentRefusesACleartextGateOffLoopback pins the one hop the agent does not
+// leave to chance. Over plaintext ws:// to a host that is not this machine, the
+// dial-in key and the inbox key it seals its token to are both readable and
+// rewritable by anyone on the path, and a rewritten inbox key is a token handed
+// to whoever rewrote it.
+func TestAgentRefusesACleartextGateOffLoopback(t *testing.T) {
+	base := AgentConfig{
+		SharedKey:      []byte("k"),
+		Self:           hub.AgentRegister{Provider: "p"},
+		AllowedTargets: []string{"api.example.com"},
+	}
+	cases := []struct {
+		name  string
+		gate  string
+		allow bool
+		ok    bool
+	}{
+		{"plaintext to a remote hub", "ws://hub.example/v1/agent", false, false},
+		{"plaintext to loopback", "ws://127.0.0.1:18085/v1/agent", false, true},
+		{"plaintext to localhost", "ws://localhost:18085/v1/agent", false, true},
+		{"TLS to a remote hub", "wss://hub.example/v1/agent", false, true},
+		{"plaintext opted in", "ws://hub.example/v1/agent", true, true},
+	}
+	for _, tc := range cases {
+		cfg := base
+		cfg.HubGateURL = tc.gate
+		cfg.AllowCleartextGate = tc.allow
+		_, err := NewAgent(cfg)
+		if tc.ok && err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+		}
+		if !tc.ok && !errors.Is(err, ErrCleartextGate) {
+			t.Errorf("%s: error = %v, want %v", tc.name, err, ErrCleartextGate)
+		}
+	}
+}
+
 // TestAgentDiscoversModelsFromUpstream pins the no-config path: an agent with
 // no explicit model list fetches the conventional /v1/models endpoint before
 // it comes online and reports the discovered list at registration.

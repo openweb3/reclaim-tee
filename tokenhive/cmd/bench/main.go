@@ -129,7 +129,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "bench: direct mode: %v\n", dErr)
 		}
 	case "tee":
-		teeRep, tErr = runTEE(*n, *provider, *query, *maxBytes, body, *teeURL, cred)
+		teeRep, tErr = runTEE(*n, *model, *provider, *query, *maxBytes, body, *teeURL, cred)
 		if tErr != nil {
 			fmt.Fprintf(os.Stderr, "bench: tee mode: %v\n", tErr)
 		}
@@ -138,7 +138,7 @@ func main() {
 		if dErr != nil {
 			fmt.Fprintf(os.Stderr, "bench: direct mode: %v\n", dErr)
 		}
-		teeRep, tErr = runTEE(*n, *provider, *query, *maxBytes, body, *teeURL, cred)
+		teeRep, tErr = runTEE(*n, *model, *provider, *query, *maxBytes, body, *teeURL, cred)
 		if tErr != nil {
 			fmt.Fprintf(os.Stderr, "bench: tee mode: %v\n", tErr)
 		}
@@ -225,13 +225,13 @@ func oneDirect(client *http.Client, url string, body []byte, maxBytes uint64) (s
 // ---------------------------------------------------------------------------
 // TEE mode: client -> simulated TEE -> Hub relay -> Agent -> provider.
 // ---------------------------------------------------------------------------
-func runTEE(n int, host, query string, maxBytes uint64, body []byte, teeURL string, cred []byte) (*report, error) {
+func runTEE(n int, model, host, query string, maxBytes uint64, body []byte, teeURL string, cred []byte) (*report, error) {
 	client := &http.Client{} // plain HTTP to the local TEE
 	samples := make([]sample, 0, n)
 	totalWall := time.Duration(0)
 	totalPayload := int64(0)
 	for i := 0; i < n; i++ {
-		spec, err := shared.BuildSpec("openai-sim", host, "/v1/chat/completions", query, body, maxBytes)
+		spec, err := shared.BuildSpec("openai-sim", model, host, "/v1/chat/completions", query, body, maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -248,7 +248,7 @@ func runTEE(n int, host, query string, maxBytes uint64, body []byte, teeURL stri
 }
 
 func oneTEE(client *http.Client, teeURL string, spec jobs.Spec, body []byte) (sample, error) {
-	reqBody, err := tee.ExecuteRequest{Spec: spec, Body: body}.EncodeCanonical()
+	reqBody, err := tee.Job{Spec: spec, Body: body}.EncodeCanonical()
 	if err != nil {
 		return sample{}, err
 	}

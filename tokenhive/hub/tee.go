@@ -3,11 +3,16 @@ package hub
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 
@@ -155,7 +160,7 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 	if t.URL == "" {
 		return Result{}, errors.New("hub: TEE URL is empty")
 	}
-	enc, err := tee.ExecuteRequest{Spec: spec, Body: body}.EncodeCanonical()
+	enc, err := tee.Job{Spec: spec, Body: body}.EncodeCanonical()
 	if err != nil {
 		return Result{}, fmt.Errorf("encode execute request: %w", err)
 	}
@@ -169,6 +174,21 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 	if client == nil {
 		client = http.DefaultClient
 	}
+	// Capture the certificate of the connection that will carry the answer, so
+	// the receipt can be bound to it once it arrives (see bindConnection).
+	var (
+		spkiMu   sync.Mutex
+		peerSPKI []byte
+	)
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			spki := tlsPeerSPKI(info.Conn)
+			spkiMu.Lock()
+			peerSPKI = spki
+			spkiMu.Unlock()
+		},
+	}))
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return Result{}, err
@@ -179,7 +199,165 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return Result{}, fmt.Errorf("tee http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	return readSSE(resp.Body, onChunk, onStart...)
+	// A backstop on what one response may cost this Hub in memory. The TEE
+	// enforces MaxResponseBytes itself, so an honest peer never trips this; a
+	// peer that ignores its own spec would otherwise stream until the attempt
+	// times out, with every chunk retained for settlement.
+	limit := spec.MaxResponseBytes
+	var total uint64
+	guard := func(chunk []byte) error {
+		total += uint64(len(chunk))
+		if limit > 0 && total > limit {
+			return fmt.Errorf("%w: read %d bytes, cap %d", ErrResponseTooLarge, total, limit)
+		}
+		if onChunk != nil {
+			return onChunk(chunk)
+		}
+		return nil
+	}
+	res, err := readSSE(resp.Body, guard, onStart...)
+	if err != nil {
+		return res, err
+	}
+	// The receipt must describe the job the Hub asked for, and be signed by the
+	// key the connection that carried it presented.
+	if err := bindReceipt(spec, res.Receipt.Receipt); err != nil {
+		return res, err
+	}
+	spkiMu.Lock()
+	spki := peerSPKI
+	spkiMu.Unlock()
+	if err := bindConnection(spki, secureChannel(t.URL), res.Receipt.Receipt); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// ErrResponseTooLarge means the TEE streamed more response bytes than the job's
+// spec allowed. The TEE bounds a response itself, so this is the Hub's backstop
+// against a peer that does not: without it the Hub would buffer an unbounded
+// body, because the chunks are retained to settle against.
+var ErrResponseTooLarge = errors.New("tee response exceeds the job's response cap")
+
+// ErrReceiptSpecMismatch means a receipt does not describe the job the Hub
+// dispatched. The signature and attestation can both be genuine — the TEE is
+// real — while the receipt names a different request; pricing, attribution and
+// the provider's audit all assume the receipt proves *this* exchange, so such a
+// receipt must never settle.
+var ErrReceiptSpecMismatch = errors.New("receipt does not describe the dispatched job")
+
+// bindReceipt checks that a receipt names the request the Hub actually sent:
+// the same spec hash, provider, host, path and declared model. The Hub authors
+// the spec and signs nothing, so the receipt's own JobSpecHash is the only
+// thing tying the attested response back to the request; nothing else compares
+// it. The model is compared alongside the rest because it is the key the charge
+// is computed from, and a receipt that names another one would settle a job
+// against a price nobody quoted.
+func bindReceipt(spec jobs.Spec, r proof.Receipt) error {
+	want, err := spec.Hash()
+	if err != nil {
+		return fmt.Errorf("hash dispatched spec: %w", err)
+	}
+	switch {
+	case r.Provider != spec.Provider:
+		return fmt.Errorf("%w: receipt provider %q, dispatched %q", ErrReceiptSpecMismatch, r.Provider, spec.Provider)
+	case r.Host != spec.Host:
+		return fmt.Errorf("%w: receipt host %q, dispatched %q", ErrReceiptSpecMismatch, r.Host, spec.Host)
+	case r.Path != spec.Path:
+		return fmt.Errorf("%w: receipt path %q, dispatched %q", ErrReceiptSpecMismatch, r.Path, spec.Path)
+	case r.Model != spec.Model:
+		return fmt.Errorf("%w: receipt model %q, dispatched %q", ErrReceiptSpecMismatch, r.Model, spec.Model)
+	case !streamHashEq(r.JobSpecHash, want[:]):
+		return fmt.Errorf("%w: spec hash %x, dispatched %x", ErrReceiptSpecMismatch, r.JobSpecHash, want)
+	}
+	return nil
+}
+
+// ErrReceiptNotBoundToConnection means the receipt was signed by a key other
+// than the one the connection that carried it presented. RA-TLS exists so a
+// receipt and the certificate it arrived over are the same attested epoch;
+// without this check a rotated or forged key could sign a receipt the Hub would
+// accept on evidence it never saw on that connection.
+var ErrReceiptNotBoundToConnection = errors.New("receipt signing key is not the certificate the connection presented")
+
+// bindConnection checks that a receipt's signing key is the key the connection
+// that carried it presented. peerSPKI is empty on a plaintext channel — the
+// local simulation — and there is then no peer identity to bind and nothing to
+// assert.
+//
+// requirePeer is what keeps that skip from being a way out: it says the channel
+// is TLS, so a certificate was presented and read. An empty peerSPKI there means
+// the capture failed, not that there was nothing to bind, and the receipt is
+// refused rather than accepted on a check that did not run.
+func bindConnection(peerSPKI []byte, requirePeer bool, r proof.Receipt) error {
+	if len(peerSPKI) == 0 {
+		if requirePeer {
+			return fmt.Errorf("%w: TLS channel presented no certificate to bind", ErrReceiptNotBoundToConnection)
+		}
+		return nil
+	}
+	if r.Attestation == nil {
+		return fmt.Errorf("%w: receipt carries no attestation", ErrReceiptNotBoundToConnection)
+	}
+	if !bytes.Equal(peerSPKI, r.Attestation.KeyID) {
+		return fmt.Errorf("%w: connection SPKI %x, receipt key %x", ErrReceiptNotBoundToConnection, peerSPKI, r.Attestation.KeyID)
+	}
+	return nil
+}
+
+// secureChannel reports whether a Hub↔TEE URL carries TLS, and therefore
+// whether a receipt arriving over it must be bound to the certificate that
+// carried it. It reads the scheme the Hub was configured with rather than what
+// a dial happened to reveal, so a transport that hides its connection cannot
+// turn the binding off.
+func secureChannel(url string) bool {
+	return strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "wss://")
+}
+
+// spkiDigest is the identity of a certificate: SHA-256 over its
+// SubjectPublicKeyInfo, which is exactly the receipt's Attestation.KeyID (see
+// proof.AttestationRef and platform.Identity, both over the same DER).
+func spkiDigest(cert *x509.Certificate) []byte {
+	if cert == nil {
+		return nil
+	}
+	sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+	return sum[:]
+}
+
+// tlsPeerSPKI returns the SPKI digest of the certificate a connection
+// presented, or nil when conn is not a TLS connection or presented none.
+func tlsPeerSPKI(conn net.Conn) []byte {
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return nil
+	}
+	certs := tc.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil
+	}
+	return spkiDigest(certs[0])
+}
+
+// spkiCapture records the SPKI digest of the certificate a dialer's handshake
+// accepted. The handshake may complete on a different goroutine than the one
+// that asked for the connection, so the two sides are ordered rather than left
+// to luck.
+type spkiCapture struct {
+	mu     sync.Mutex
+	digest []byte
+}
+
+func (c *spkiCapture) set(digest []byte) {
+	c.mu.Lock()
+	c.digest = digest
+	c.mu.Unlock()
+}
+
+func (c *spkiCapture) get() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.digest
 }
 
 // CredentialKey implements CredentialService.
@@ -254,7 +432,13 @@ func readSSE(r io.Reader, onChunk func([]byte) error, onStart ...func(tee.Respon
 				// handed without being able to alter the evidence.
 				result.Chunks = append(result.Chunks, []byte(frame.Data))
 				if onChunk != nil {
-					_ = onChunk([]byte(frame.Data))
+					// A consumer that stopped taking bytes — a client that will not
+					// read, a link that broke — ends the exchange here. Ignoring the
+					// error instead leaves the Hub pulling a body nobody receives,
+					// which is how a stalled reader becomes unbounded buffering.
+					if cerr := onChunk([]byte(frame.Data)); cerr != nil {
+						return result, cerr
+					}
 				}
 			}
 		case tee.EventStart:

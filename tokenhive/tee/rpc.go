@@ -10,13 +10,11 @@ import (
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
 
 // The Hub↔TEE interface is a single RPC: POST /v1/execute carrying a canonical
-// ExecuteRequest, answered by an SSE stream with three kinds of frame in a
-// fixed order:
+// Job, answered by an SSE stream with three kinds of frame in a fixed order:
 //
 //  1. 响应开始 — event: start, one frame carrying the upstream status code and
 //     the allowlisted response headers (see ForwardResponseHeaders), emitted
@@ -48,10 +46,10 @@ const (
 	// case loses the reason; they are deliberately distinct.
 	EventError = "error"
 
-	// MaxExecuteBody bounds the canonical-CBOR ExecuteRequest the TEE will
-	// read. A job spec plus its request body is small; a caller declaring a
-	// gigabyte is not submitting a job, it is attempting to exhaust the
-	// enclave's memory before any policy check runs.
+	// MaxExecuteBody bounds the canonical-CBOR Job the TEE will read. A job
+	// spec plus its request body is small; a caller declaring a gigabyte is not
+	// submitting a job, it is attempting to exhaust the enclave's memory before
+	// any policy check runs.
 	MaxExecuteBody = 8 << 20
 
 	// executeReadTimeout bounds how long the TEE spends reading that body, so
@@ -71,31 +69,17 @@ type startFrame struct {
 	Headers map[string][]string `json:"headers,omitempty"`
 }
 
-// ExecuteRequest is the body of POST /v1/execute: a canonical JobSpec plus the
-// raw request bytes the TEE will send to the provider.
-//
-// The wire type lives beside the service that consumes it rather than beside
-// the Hub that produces it, so that the client and the server are written
-// against one definition and cannot drift apart.
-type ExecuteRequest struct {
-	Spec jobs.Spec `cbor:"1,keyasint"`
-	Body []byte    `cbor:"2,keyasint"`
-}
-
-// EncodeCanonical returns the deterministic CBOR encoding of the request.
-func (r ExecuteRequest) EncodeCanonical() ([]byte, error) { return canonical.Marshal(r) }
-
-// DecodeExecuteRequest parses a canonical-CBOR ExecuteRequest.
-func DecodeExecuteRequest(data []byte) (ExecuteRequest, error) {
-	var r ExecuteRequest
-	if err := canonical.Unmarshal(data, &r); err != nil {
-		return ExecuteRequest{}, err
+// DecodeJob parses the canonical-CBOR body of a job endpoint. Decoding
+// enforces canonical form, so a request whose bytes were rewritten into an
+// equivalent but non-canonical encoding is rejected rather than accepted under
+// a different hash than the one it will be judged by.
+func DecodeJob(data []byte) (Job, error) {
+	var job Job
+	if err := canonical.Unmarshal(data, &job); err != nil {
+		return Job{}, err
 	}
-	return r, nil
+	return job, nil
 }
-
-// Job converts the request into the execution input the Service takes.
-func (r ExecuteRequest) Job() Job { return Job{Spec: r.Spec, Body: r.Body} }
 
 // ServeExecute is the server half of the single RPC. It wraps the real
 // Service: nothing here re-implements the TEE, it only adapts the execution
@@ -134,7 +118,7 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 	// outlives the window mid-stream, however healthy it is. Bounding the body
 	// read must not bound the answer.
 	_ = control.SetReadDeadline(time.Time{})
-	req, err := DecodeExecuteRequest(raw)
+	job, err := DecodeJob(raw)
 	if err != nil {
 		http.Error(w, "decode request: "+err.Error(), http.StatusBadRequest)
 		return
@@ -159,7 +143,7 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res, err := svc.Execute(r.Context(), req.Job(), onChunk, onStart)
+	res, err := svc.Execute(r.Context(), job, onChunk, onStart)
 	if err != nil {
 		writeEvent(w, flusher, EventError, err.Error())
 		return

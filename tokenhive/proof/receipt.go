@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 )
 
@@ -84,6 +85,7 @@ var (
 	ErrInvalidJobSpecHash  = errors.New("invalid job spec hash")
 	ErrInvalidStreamHash   = errors.New("invalid response stream hash")
 	ErrInvalidHeaderHash   = errors.New("invalid response headers hash")
+	ErrInvalidModel        = errors.New("invalid model")
 	ErrInvalidPolicyHash   = errors.New("invalid policy hash")
 	ErrInvalidCompletion   = errors.New("invalid completion state")
 	ErrInvalidTimeRange    = errors.New("invalid time range")
@@ -165,6 +167,16 @@ type Receipt struct {
 	// that never produced a response (CompletionFailed, no start frame) has
 	// nothing to attest, so it stays empty.
 	ResponseHeadersHash []byte `cbor:"19,keyasint,omitempty"`
+
+	// Model is the model the Hub declared for this job, which is the key its
+	// rate card prices the premium on. The TEE cannot verify a model — it does
+	// not know one vendor's model list from another's — so this is an attestation
+	// of what was asked, not a claim that the request carried it: the signed
+	// statement is "the Hub routed and priced this exchange as this model",
+	// which is exactly what a provider needs to reconcile the receipt against
+	// its own upstream bill, and which a Hub that under-declared cannot later
+	// disown. Optional: a deployment that does not price by model omits it.
+	Model string `cbor:"20,keyasint,omitempty"`
 }
 
 // SignedReceipt is a receipt together with the TEE's signature over it.
@@ -196,6 +208,17 @@ func (r Receipt) Validate() error {
 	}
 	if len(r.ResponseHeadersHash) != 0 && len(r.ResponseHeadersHash) != StreamHashLength {
 		return fmt.Errorf("%w: length %d, want %d", ErrInvalidHeaderHash, len(r.ResponseHeadersHash), StreamHashLength)
+	}
+	// The bound is jobs', not a copy of it: the receipt and the spec it
+	// describes have to agree on what a model identifier may look like, and two
+	// constants that agree by convention eventually do not.
+	if len(r.Model) > jobs.MaxModelLength {
+		return fmt.Errorf("%w: %q exceeds %d bytes", ErrInvalidModel, r.Model, jobs.MaxModelLength)
+	}
+	for _, ch := range r.Model {
+		if ch <= ' ' || ch == '\x7f' {
+			return fmt.Errorf("%w: %q contains a control character", ErrInvalidModel, r.Model)
+		}
 	}
 	if len(r.PolicyHash) != PolicyHashLength {
 		return fmt.Errorf("%w: length %d, want %d", ErrInvalidPolicyHash, len(r.PolicyHash), PolicyHashLength)

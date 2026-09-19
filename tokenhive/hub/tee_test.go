@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -94,4 +96,30 @@ func TestCredentialKeyCoalescesAConnectingFleet(t *testing.T) {
 
 func sameKey(a, b tee.InboxPublic) bool {
 	return a.KeyID == b.KeyID && bytes.Equal(a.PublicKey, b.PublicKey)
+}
+
+// TestReadSSEStopsWhenTheConsumerRefusesAChunk pins the contract that stops a
+// stalled reader from turning into unbounded work on the Hub: a consumer that
+// returns an error ends the exchange at that chunk. Draining the rest of the
+// body anyway is what let a client that would not read keep the Hub pulling and
+// buffering a response nobody was receiving.
+func TestReadSSEStopsWhenTheConsumerRefusesAChunk(t *testing.T) {
+	stream := strings.Join([]string{
+		"event: start\ndata: {\"status\":200}\n\n",
+		"data: one\n\n",
+		"data: two\n\n",
+	}, "")
+
+	stop := errors.New("client is gone")
+	var seen int
+	_, err := readSSE(strings.NewReader(stream), func([]byte) error {
+		seen++
+		return stop
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("readSSE err = %v, want the consumer's own error", err)
+	}
+	if seen != 1 {
+		t.Fatalf("consumer called %d times, want 1: the stream must end at the first refusal", seen)
+	}
 }
