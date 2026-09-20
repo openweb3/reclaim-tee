@@ -245,7 +245,7 @@ func SealCredential(teeBase, provider string, secret tee.Secret) (tee.Envelope, 
 // (cmd/hub -n, cmd/hub's user API, cmd/bench) has to emit the same shape — a
 // bench whose spec differed from the Hub's would measure a different path than
 // the one the Hub drives.
-func BuildSpec(provider, host, path, query string, body []byte, maxBytes uint64) (jobs.Spec, error) {
+func BuildSpec(provider, model, host, path, query string, body []byte, maxBytes uint64) (jobs.Spec, error) {
 	jobID := make([]byte, jobs.JobIDLength)
 	if _, err := rand.Read(jobID); err != nil {
 		return jobs.Spec{}, err
@@ -258,6 +258,7 @@ func BuildSpec(provider, host, path, query string, body []byte, maxBytes uint64)
 		Version:          jobs.VersionV1,
 		JobID:            jobID,
 		Provider:         provider,
+		Model:            model,
 		Method:           "POST",
 		Host:             host,
 		Path:             path,

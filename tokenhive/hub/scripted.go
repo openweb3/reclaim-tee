@@ -61,6 +61,19 @@ func (s *ScriptedTEE) Execute(_ context.Context, spec jobs.Spec, _ []byte, onChu
 		return Result{}, errors.New("scripted tee has no Reply set")
 	}
 	res, err := s.Reply(call, spec)
+	// A real enclave always answers about the job it was handed, so the scripted
+	// one does too: a test that could script a receipt naming another request
+	// would be testing a Hub behaviour no real TEE can produce, and one that
+	// forgot to fill the binding in would quietly exercise less than it looks
+	// like. (What such a receipt should do to the Hub is pinned in tee_test.go,
+	// against the real client.)
+	if specHash, herr := spec.Hash(); herr == nil {
+		res.Receipt.Receipt.Provider = spec.Provider
+		res.Receipt.Receipt.Host = spec.Host
+		res.Receipt.Receipt.Path = spec.Path
+		res.Receipt.Receipt.Model = spec.Model
+		res.Receipt.Receipt.JobSpecHash = specHash[:]
+	}
 	if res.Status != 0 {
 		// Bind the receipt to the start the Hub is about to be shown. The
 		// receipt may already carry a hash (a test that crafts one); filling

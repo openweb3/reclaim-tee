@@ -55,7 +55,7 @@ func runStreamingJobs(t *testing.T, target string, srv *httptest.Server, n int) 
 	for i := 0; i < n; i++ {
 		spec, body := localChatCompletion(t, target)
 		spec.Credential = cred
-		result, err := executeEventually(t, service, spec, body, func([]byte) error { return nil })
+		result, err := executeEventually(t, service, &spec, body, func([]byte) error { return nil })
 		if err != nil {
 			t.Fatalf("job %d: %v", i, err)
 		}

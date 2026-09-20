@@ -41,6 +41,7 @@ func main() {
 	token := flag.String("token", "", "the provider's access token (API key). Required; sealed to the TEE at registration — the Hub never sees it")
 	authScheme := flag.String("auth-scheme", "auto", "prefix before the token in the auth header: auto, a literal scheme (e.g. Bearer), or empty for a raw-token header")
 	authHeader := flag.String("auth-header", "authorization", "request header the token travels in (e.g. authorization, x-api-key)")
+	allowCleartext := flag.Bool("allow-cleartext-gate", false, "permit a -hub that is plaintext ws:// to a host other than loopback (only for a hop something else already protects)")
 	timeout := flag.Duration("connect-timeout", 10*time.Second, "bounds dialing the Hub and each upstream")
 	reconnect := flag.Duration("reconnect", time.Second, "pause between reconnect attempts after the tunnel drops")
 	maxConns := flag.Int("max-conns", provider.DefaultMaxRelayConns, "how many relay streams to serve at once; streams past this are refused so the Hub can route to another provider (0 = unlimited)")
@@ -81,13 +82,14 @@ func main() {
 	}
 
 	cfg := provider.AgentConfig{
-		HubGateURL:     *gate,
-		SharedKey:      []byte(*key),
-		AllowedTargets: allowed,
-		ConnectTimeout: *timeout,
-		ReconnectDelay: *reconnect,
-		MaxRelayConns:  *maxConns,
-		RelayIdle:      *relayIdle,
+		HubGateURL:         *gate,
+		SharedKey:          []byte(*key),
+		AllowedTargets:     allowed,
+		AllowCleartextGate: *allowCleartext,
+		ConnectTimeout:     *timeout,
+		ReconnectDelay:     *reconnect,
+		MaxRelayConns:      *maxConns,
+		RelayIdle:          *relayIdle,
 		Self: hub.AgentRegister{
 			Provider:    *providerName,
 			DisplayName: *name,

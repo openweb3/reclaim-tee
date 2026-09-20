@@ -299,11 +299,33 @@ func (h *Hub) SearchModels(query string) []ModelQuote {
 func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []byte,
 	build func(provider string) (jobs.Spec, error), onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
 
-	providers := h.providersForModel(model)
-	if len(providers) == 0 {
-		return Outcome{}, h.supplyError(model)
+	providers, err := h.candidatesForModel(model, "")
+	if err != nil {
+		return Outcome{}, err
 	}
 	return h.executeForProviders(ctx, tenant, model, providers, body, build, onChunk, onStart...)
+}
+
+// candidatesForModel resolves who may serve a job for a model: every current
+// server, cheapest floor first, or the single named source when the buyer pinned
+// one. A pinned request is never substituted — the buyer asked for that source,
+// and routing it elsewhere would silently override the choice — so a pin is
+// resolved or refused.
+//
+// It is the one place either plane decides who is a candidate, so a request and
+// a streaming session dispatch from the same supply under the same rules.
+func (h *Hub) candidatesForModel(model, provider string) ([]string, error) {
+	if provider != "" {
+		if !h.providerServes(provider, model) {
+			return nil, fmt.Errorf("%w: model %q from provider %q", ErrNoProviderForModel, model, provider)
+		}
+		return []string{provider}, nil
+	}
+	providers := h.providersForModel(model)
+	if len(providers) == 0 {
+		return nil, h.supplyError(model)
+	}
+	return providers, nil
 }
 
 // ExecuteForProvider runs a job for a model pinned to one named source, with no
@@ -319,10 +341,11 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 func (h *Hub) ExecuteForProvider(ctx context.Context, tenant, model, provider string, body []byte,
 	build func(provider string) (jobs.Spec, error), onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
 
-	if !h.providerServes(provider, model) {
-		return Outcome{}, fmt.Errorf("%w: model %q from provider %q", ErrNoProviderForModel, model, provider)
+	providers, err := h.candidatesForModel(model, provider)
+	if err != nil {
+		return Outcome{}, err
 	}
-	return h.executeForProviders(ctx, tenant, model, []string{provider}, body, build, onChunk, onStart...)
+	return h.executeForProviders(ctx, tenant, model, providers, body, build, onChunk, onStart...)
 }
 
 // executeForProviders is the shared workhorse behind ExecuteForModel and

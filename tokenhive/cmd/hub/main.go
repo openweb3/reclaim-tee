@@ -287,7 +287,7 @@ func main() {
 
 	for i := 1; i <= *n; i++ {
 		fmt.Printf("\n=== request %d/%d ===\n", i, *n)
-		spec, err := shared.BuildSpec(*provider, serveCfg.HostFor(*provider), "/v1/chat/completions", *query, body, *maxBytes)
+		spec, err := shared.BuildSpec(*provider, *model, serveCfg.HostFor(*provider), "/v1/chat/completions", *query, body, *maxBytes)
 		if err != nil {
 			logf("build spec: %v", err)
 			continue

@@ -53,14 +53,24 @@ func (memStore) Put(string, proof.SignedReceipt) error { return nil }
 // that never got a response). Both are retried — the second because an empty
 // relay handshake is indistinguishable, from the result alone, from a provider
 // that is simply not reachable yet.
-func executeEventually(t *testing.T, service *tee.Service, spec jobs.Spec, body []byte,
+//
+// Each attempt is a new job: the id and nonce are re-minted per try, as a Hub
+// dispatch does, and spec is updated in place so the caller verifies its
+// receipt against the attempt that actually ran. The enclave refuses a job ID
+// it has already seen (see tee.ErrJobReplayed), so a retry that reused one
+// would be the last attempt.
+func executeEventually(t *testing.T, service *tee.Service, spec *jobs.Spec, body []byte,
 	onChunk func([]byte) error) (*tee.Result, error) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	var last *tee.Result
 	var err error
 	for {
-		last, err = service.Execute(context.Background(), tee.Job{Spec: spec, Body: body}, onChunk)
+		attempt := *spec
+		attempt.JobID = randomBytes(t, jobs.JobIDLength)
+		attempt.Nonce = randomBytes(t, jobs.MinNonceLength)
+		*spec = attempt
+		last, err = service.Execute(context.Background(), tee.Job{Spec: attempt, Body: body}, onChunk)
 		if err == nil && last.StatusCode != 0 {
 			return last, nil
 		}
@@ -275,7 +285,7 @@ func TestEndToEndSSEThroughProviderAgent(t *testing.T) {
 	spec.Credential = cred
 
 	var relayed [][]byte
-	result, err := executeEventually(t, service, spec, body, func(chunk []byte) error {
+	result, err := executeEventually(t, service, &spec, body, func(chunk []byte) error {
 		relayed = append(relayed, append([]byte(nil), chunk...))
 		return nil
 	})
@@ -368,7 +378,7 @@ func TestEndToEndMidStreamDisconnect(t *testing.T) {
 	spec.Credential = cred
 
 	var relayed [][]byte
-	result, err := executeEventually(t, service, spec, body, func(chunk []byte) error {
+	result, err := executeEventually(t, service, &spec, body, func(chunk []byte) error {
 		relayed = append(relayed, append([]byte(nil), chunk...))
 		return nil
 	})

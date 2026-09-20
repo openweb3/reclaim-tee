@@ -602,3 +602,62 @@ func TestReadTimeoutDoesNotTruncateAResponseStream(t *testing.T) {
 		t.Fatalf("streamed body = %q, want both halves: a read timeout must not cut a response", body)
 	}
 }
+
+// writeDeadlineRecorder is a ResponseWriter that records the write deadlines a
+// handler arms, so a test can prove a user response is bounded without waiting
+// out a real timeout against a stalled socket.
+type writeDeadlineRecorder struct {
+	hdr       http.Header
+	deadlines []time.Time
+	status    int
+}
+
+func (w *writeDeadlineRecorder) Header() http.Header {
+	if w.hdr == nil {
+		w.hdr = http.Header{}
+	}
+	return w.hdr
+}
+func (w *writeDeadlineRecorder) Write(p []byte) (int, error) { return len(p), nil }
+func (w *writeDeadlineRecorder) WriteHeader(code int)        { w.status = code }
+func (w *writeDeadlineRecorder) Flush()                      {}
+func (w *writeDeadlineRecorder) SetWriteDeadline(t time.Time) error {
+	w.deadlines = append(w.deadlines, t)
+	return nil
+}
+
+// TestUserRouteBoundsTheWriteBackToTheClient pins that every user response
+// carries a write deadline, and that the deadline is cleared on the way out so a
+// pooled connection does not inherit a spent one. Without the deadline a client
+// that stops reading blocks the handler (and the tenant's in-flight slot) for as
+// long as it likes.
+func TestUserRouteBoundsTheWriteBackToTheClient(t *testing.T) {
+	route := userRoutes[0]
+	handler := &userHandler{
+		h:     newServeTestHub(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n")),
+		cfg:   serveConfig{Host: "127.0.0.1:18080", Max: 1 << 20},
+		route: route,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(`{"model":"sim-mock-0.5b"}`))
+	req.Header.Set(tenantKeyHeader, "tenant-test")
+	w := &writeDeadlineRecorder{}
+
+	handler.ServeHTTP(w, req)
+
+	if len(w.deadlines) < 2 {
+		t.Fatalf("recorded %d write deadlines, want at least one armed and one cleared", len(w.deadlines))
+	}
+	armed := false
+	for _, d := range w.deadlines {
+		if !d.IsZero() {
+			armed = true
+		}
+	}
+	if !armed {
+		t.Fatal("handler never armed a write deadline on the user response")
+	}
+	if last := w.deadlines[len(w.deadlines)-1]; !last.IsZero() {
+		t.Fatalf("final write deadline = %v, want zero (cleared for the next request)", last)
+	}
+}

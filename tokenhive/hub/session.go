@@ -2,7 +2,7 @@ package hub
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"sync"
@@ -24,8 +24,7 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 	if t.SessionURL == "" {
 		return nil, ErrSessionUnsupported
 	}
-	req := tee.SessionRequest{Spec: spec}
-	first, err := req.EncodeCanonical()
+	first, err := tee.Job{Spec: spec}.EncodeCanonical()
 	if err != nil {
 		return nil, fmt.Errorf("encode session request: %w", err)
 	}
@@ -34,6 +33,36 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 	if dialer == nil {
 		dialer = websocket.DefaultDialer
 	}
+	// Capture the certificate of the connection that will carry the session's
+	// terminal receipt, so the receipt can be bound to it (see bindConnection).
+	// The hook rides the handshake the dialer already performs — it is handed the
+	// state the chain check just accepted — instead of dialing TLS here, which
+	// would mean reimplementing the part that decides what to trust. It goes on a
+	// copy of the dialer's TLS config because one dialer serves every concurrent
+	// session and none of them may see another's connection.
+	capture := &spkiCapture{}
+	local := *dialer
+	cfg := local.TLSClientConfig
+	if cfg == nil {
+		cfg = &tls.Config{}
+	} else {
+		cfg = cfg.Clone()
+	}
+	accepted := cfg.VerifyConnection
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if accepted != nil {
+			if err := accepted(cs); err != nil {
+				return err
+			}
+		}
+		if len(cs.PeerCertificates) > 0 {
+			capture.set(spkiDigest(cs.PeerCertificates[0]))
+		}
+		return nil
+	}
+	local.TLSClientConfig = cfg
+	dialer = &local
+
 	conn, _, err := dialer.DialContext(ctx, t.SessionURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dial TEE session: %w", err)
@@ -53,17 +82,17 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 		_ = conn.Close()
 		return nil, fmt.Errorf("session ack was not text (type %d)", mt)
 	}
-	var ackJSON map[string]any
-	if err := json.Unmarshal(ack, &ackJSON); err != nil {
+	if err := tee.ParseSessionAck(ack); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("decode session ack %q: %w", ack, err)
-	}
-	if _, refused := ackJSON["error"]; refused {
-		_ = conn.Close()
-		return nil, fmt.Errorf("%w: TEE refused session: %s", ErrTEERefused, ack)
+		return nil, fmt.Errorf("%w: %v", ErrTEERefused, err)
 	}
 
-	return &sessionTunnel{conn: conn}, nil
+	return &sessionTunnel{
+		conn:        conn,
+		spec:        spec,
+		peerSPKI:    capture.get(),
+		requirePeer: secureChannel(t.SessionURL),
+	}, nil
 }
 
 // sessionTunnel is the concrete SessionConn behind HTTPTEE.OpenSession.
@@ -81,6 +110,17 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 // next Read yields io.EOF. Write forwards uplink bytes verbatim.
 type sessionTunnel struct {
 	conn *websocket.Conn
+
+	// spec is the job this tunnel was opened for, kept so the terminal receipt
+	// can be bound back to it (see bindReceipt).
+	spec jobs.Spec
+
+	// peerSPKI is the certificate the connection presented, and requirePeer says
+	// whether the channel is TLS and therefore had to present one. Together they
+	// bind the terminal receipt to the connection that carried it, exactly as the
+	// request path does (see bindConnection).
+	peerSPKI    []byte
+	requirePeer bool
 
 	readMu  sync.Mutex // serializes the downlink reader (one reader only)
 	writeMu sync.Mutex // serializes the uplink writer (one writer only)
@@ -150,6 +190,16 @@ func (s *sessionTunnel) Read(p []byte) (int, error) {
 				s.mu.Unlock()
 				return 0, s.readErr
 			}
+			// The session receipt must describe the session the Hub opened, and
+			// be signed by the key the connection that carried it presented. A
+			// mismatched one settles nothing, so it is refused here rather than
+			// handed on as if it accounted for this transcript.
+			if berr := s.bind(signed.Receipt); berr != nil {
+				s.mu.Lock()
+				s.readErr = berr
+				s.mu.Unlock()
+				return 0, berr
+			}
 			s.mu.Lock()
 			s.receipt = signed
 			s.haveReceipt = true
@@ -158,6 +208,15 @@ func (s *sessionTunnel) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 	}
+}
+
+// bind checks a terminal receipt against what this tunnel knows: the spec that
+// was dispatched, and the certificate the connection presented.
+func (s *sessionTunnel) bind(r proof.Receipt) error {
+	if err := bindReceipt(s.spec, r); err != nil {
+		return err
+	}
+	return bindConnection(s.peerSPKI, s.requirePeer, r)
 }
 
 func (s *sessionTunnel) Receipt() (proof.SignedReceipt, error) {

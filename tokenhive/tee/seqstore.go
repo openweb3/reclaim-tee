@@ -1,11 +1,13 @@
 package tee
 
 import (
-	"encoding/json"
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -79,11 +81,21 @@ func (s *memorySeqStore) Peek(providerID []byte) (uint64, error) {
 
 func (s *memorySeqStore) Close() error { return nil }
 
-// fileSeqStore persists counters to one JSON file.
+// fileSeqStore persists counters as an append-only log of "<provider> <seq>"
+// lines, one line per number issued. Appending is what makes Next both cheap
+// and honest: a job costs one small write and one fsync, never a rewrite of
+// every provider's counter, and the number is on disk before it is returned.
+//
+// The log is bounded, not linear: once it holds well past one record per
+// provider it is rewritten in place (see compact), so its size tracks the size
+// of the market rather than the number of jobs ever run. One process per file:
+// the counters live in memory as well as on disk.
 type fileSeqStore struct {
-	mu   sync.Mutex
-	path string
-	data map[string]uint64
+	mu    sync.Mutex
+	path  string
+	data  map[string]uint64
+	lines int
+	file  *os.File
 }
 
 // NewFileSeqStore opens, or initialises, a file-backed sequence store.
@@ -98,39 +110,91 @@ func NewFileSeqStore(path string) (SeqStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("seqstore: create dir: %w", err)
 	}
-	raw, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &s.data); err != nil {
-				// Refuse rather than start from zero. An unreadable counter
-				// file is indistinguishable from a tampered one, and both
-				// mean the next number issued would be a repeat.
-				return nil, fmt.Errorf("seqstore: parse %s: %w", path, err)
-			}
+	whole, torn, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("seqstore: open %s: %w", path, err)
+	}
+	s.file = file
+
+	if torn {
+		// A crash can leave a partial record behind. The number it was writing
+		// was never returned to anyone, so the fragment is dropped — and cut
+		// off the file, because leaving it there would splice it onto the next
+		// append and invent a record naming a provider that never wrote it.
+		if err := file.Truncate(whole); err != nil {
+			s.Close()
+			return nil, fmt.Errorf("seqstore: truncate %s: %w", path, err)
 		}
-	case os.IsNotExist(err):
-		// First run.
-	default:
-		return nil, fmt.Errorf("seqstore: read %s: %w", path, err)
+	}
+	if s.compactNeededLocked() {
+		if err := s.compact(); err != nil {
+			s.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
 
-// Next persists the increment before returning it, so a number handed to a
-// receipt has already been recorded. The rollback on write failure keeps the
-// in-memory map consistent with the file rather than drifting one ahead.
+// compactNeededLocked reports whether the log has grown past the point where a
+// rewrite costs less than carrying it: one record per provider plus slack.
+// Callers hold mu.
+func (s *fileSeqStore) compactNeededLocked() bool {
+	return s.lines > 4*len(s.data)+seqLogCompactFloor
+}
+
+// handleLocked returns the append handle, reopening the file when a compaction
+// had to drop it. Callers hold mu.
+func (s *fileSeqStore) handleLocked() (*os.File, error) {
+	if s.file != nil {
+		return s.file, nil
+	}
+	file, err := os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("seqstore: open %s: %w", s.path, err)
+	}
+	s.file = file
+	return file, nil
+}
+
+// Next appends the new number and fsyncs it before returning, so a number that
+// reaches a receipt has already survived a crash. On any failure the counter is
+// left where it was, rather than drifting ahead of the file.
 func (s *fileSeqStore) Next(providerID []byte) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := string(providerID)
-	s.data[key]++
-	if err := s.flushLocked(); err != nil {
-		s.data[key]--
+	next := s.data[key] + 1
+	record, err := seqLogRecord(key, next)
+	if err != nil {
 		return 0, err
 	}
-	return s.data[key], nil
+	file, err := s.handleLocked()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := file.Write(record); err != nil {
+		return 0, fmt.Errorf("seqstore: append %s: %w", s.path, err)
+	}
+	if err := file.Sync(); err != nil {
+		return 0, fmt.Errorf("seqstore: sync %s: %w", s.path, err)
+	}
+	s.data[key] = next
+	s.lines++
+
+	if s.compactNeededLocked() {
+		// The number just issued is already durable, so a failed rewrite must
+		// not fail the request: the log stays valid and the next append sees
+		// the same condition and tries again. A rewrite that keeps failing
+		// means a full disk, which the append itself will report.
+		_ = s.compact()
+	}
+	return next, nil
 }
 
 func (s *fileSeqStore) Peek(providerID []byte) (uint64, error) {
@@ -142,20 +206,132 @@ func (s *fileSeqStore) Peek(providerID []byte) (uint64, error) {
 func (s *fileSeqStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.flushLocked()
+
+	if s.file == nil {
+		return nil
+	}
+	err := s.file.Close()
+	s.file = nil
+	return err
 }
 
-// flushLocked writes through a temporary file and renames it, so a crash
-// mid-write leaves the previous counters intact instead of a truncated file
-// the next start would refuse to parse.
-func (s *fileSeqStore) flushLocked() error {
-	encoded, err := json.MarshalIndent(s.data, "", "  ")
-	if err != nil {
-		return fmt.Errorf("seqstore: marshal: %w", err)
+// seqLogCompactFloor keeps the log from being rewritten every few jobs: below
+// this many records it is left alone however many providers it has. It is the
+// slack above one-record-per-provider, so the file stays under a few kilobytes
+// for a small market and a rewrite costs a fraction of the appends it covers.
+const seqLogCompactFloor = 256
+
+// load reads the log into memory and reports the offset of the end of the last
+// whole record, plus whether a trailing fragment was found.
+func (s *fileSeqStore) load() (int64, bool, error) {
+	raw, err := os.ReadFile(s.path)
+	switch {
+	case os.IsNotExist(err):
+		return 0, false, nil
+	case err != nil:
+		return 0, false, fmt.Errorf("seqstore: read %s: %w", s.path, err)
 	}
+	torn := len(raw) > 0 && raw[len(raw)-1] != '\n'
+	if torn {
+		raw = raw[:bytes.LastIndexByte(raw, '\n')+1]
+	}
+
+	lines := bytes.Split(raw, []byte("\n"))
+	for _, line := range lines[:len(lines)-1] {
+		key, seq, err := parseSeqRecord(line)
+		if err != nil {
+			// Refuse rather than start from zero. An unreadable counter
+			// file is indistinguishable from a tampered one, and both
+			// mean the next number issued would be a repeat.
+			return 0, false, fmt.Errorf("seqstore: parse %s: %w", s.path, err)
+		}
+		s.data[key] = seq
+		s.lines++
+	}
+	return int64(len(raw)), torn, nil
+}
+
+// compact rewrites the log as one record per provider, at startup and whenever
+// Next finds it grown past compactNeededLocked. Callers hold mu.
+func (s *fileSeqStore) compact() error {
+	var buf bytes.Buffer
+	for key, seq := range s.data {
+		record, err := seqLogRecord(key, seq)
+		if err != nil {
+			return err
+		}
+		buf.Write(record)
+	}
+
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, encoded, 0o600); err != nil {
-		return fmt.Errorf("seqstore: write: %w", err)
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("seqstore: write %s: %w", tmp, err)
 	}
-	return os.Rename(tmp, s.path)
+	_, err = file.Write(buf.Bytes())
+	if err == nil {
+		err = file.Sync()
+	}
+	if cerr := file.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("seqstore: write %s: %w", tmp, err)
+	}
+	// Rename is atomic, so a crash mid-compaction leaves the previous log
+	// intact. The directory sync is what makes the rename itself durable on
+	// filesystems that need it; the rename has happened either way, so a
+	// failure there is not fatal.
+	if err := os.Rename(tmp, s.path); err != nil {
+		return fmt.Errorf("seqstore: rename %s: %w", tmp, err)
+	}
+	if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
+		dir.Sync()
+		dir.Close()
+	}
+
+	// The rename replaced the file the append handle points at: that handle now
+	// names an unlinked inode, and appends to it would be written where nothing
+	// will ever read them. Swap the handle over before anything appends again,
+	// and drop it if the swap fails so the next call reopens rather than
+	// writing to the void.
+	reopened, err := os.OpenFile(s.path, os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		s.file.Close()
+		s.file = nil
+		return fmt.Errorf("seqstore: reopen %s: %w", s.path, err)
+	}
+	s.file.Close()
+	s.file = reopened
+	s.lines = len(s.data)
+	return nil
+}
+
+// seqLogRecord renders one log line. Provider IDs arrive as raw bytes, and a
+// separator inside one would let two providers share a counter, so an ID that
+// cannot be represented is refused instead of escaped: real provider names come
+// from the Hub's validated rate cards and never contain whitespace.
+func seqLogRecord(key string, seq uint64) ([]byte, error) {
+	if key == "" || len(key) > 512 {
+		return nil, fmt.Errorf("seqstore: unusable provider id %q", key)
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] <= ' ' || key[i] == 0x7f {
+			return nil, fmt.Errorf("seqstore: unusable provider id %q", key)
+		}
+	}
+	return []byte(fmt.Sprintf("%s %d\n", key, seq)), nil
+}
+
+func parseSeqRecord(line []byte) (string, uint64, error) {
+	key, value, ok := strings.Cut(string(line), " ")
+	if !ok {
+		return "", 0, fmt.Errorf("malformed record %q", line)
+	}
+	seq, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return "", 0, fmt.Errorf("malformed record %q", line)
+	}
+	return key, seq, nil
 }

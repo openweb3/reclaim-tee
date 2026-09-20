@@ -44,6 +44,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -59,6 +60,18 @@ var (
 	ErrNoGateURL      = errors.New("provider agent: no Hub gate URL")
 	ErrNoSharedKey    = errors.New("provider agent: no shared key")
 	ErrNoProvider     = errors.New("provider agent: no provider name")
+
+	// ErrCleartextGate means the Hub gate URL would carry this seller's secrets
+	// over a plaintext connection to a host that is not this machine. The
+	// dial-in key is what tells the Hub this machine may egress for the
+	// provider, and the key the agent seals its token to is fetched over the
+	// same hop from the Hub (see credentialKey): against a remote ws:// both are
+	// readable and rewritable by anyone on the path, and a rewritten inbox key
+	// is a token handed to an attacker. Loopback is the one cleartext hop a
+	// network attacker cannot rewrite, so it stays allowed for the local
+	// simulation and tests; anything further needs wss://, or an explicit opt-in
+	// (AllowCleartextGate) from someone who knows the hop is trusted.
+	ErrCleartextGate = errors.New("provider agent: refusing a non-loopback Hub gate over plaintext ws://")
 )
 
 // AgentConfig assembles an Agent.
@@ -122,6 +135,12 @@ type AgentConfig struct {
 	// mock provider's throwaway CA here; production leaves it nil and trusts
 	// the public roots.
 	RootCAs *x509.CertPool
+
+	// AllowCleartextGate permits a HubGateURL that is plaintext ws:// to a host
+	// other than this machine's loopback: an explicit "I know this hop is
+	// trusted" for a deployment that terminates TLS in front of the Hub on a
+	// private network, and for nothing else. See ErrCleartextGate.
+	AllowCleartextGate bool
 
 	// DialTarget replaces the outbound upstream dial. Test injection point; nil
 	// uses the standard dialer.
@@ -202,6 +221,9 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 	if cfg.MaxReconnectDelay <= 0 {
 		cfg.MaxReconnectDelay = 30 * time.Second
 	}
+	if err := checkGateTransport(cfg.HubGateURL, cfg.AllowCleartextGate); err != nil {
+		return nil, err
+	}
 	a := &Agent{cfg: cfg}
 	if cfg.MaxRelayConns > 0 {
 		a.slots = make(chan struct{}, cfg.MaxRelayConns)
@@ -213,6 +235,27 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 	// upgrading. A Hub with only a shared key ignores the header.
 	a.hdr.Set(hub.AgentProviderHeader, cfg.Self.Provider)
 	return a, nil
+}
+
+// checkGateTransport refuses a cleartext dial-in to anything but loopback (see
+// ErrCleartextGate). It runs at construction rather than at dial time so a
+// misconfigured seller learns at startup, not on the first reconnect.
+func checkGateTransport(gateURL string, allowCleartext bool) error {
+	parsed, err := url.Parse(gateURL)
+	if err != nil {
+		return fmt.Errorf("provider agent: parse Hub gate URL: %w", err)
+	}
+	if parsed.Scheme == "wss" || allowCleartext {
+		return nil
+	}
+	host := parsed.Hostname()
+	if host == "localhost" {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrCleartextGate, gateURL)
 }
 
 // Run keeps the agent online until ctx is cancelled, reconnecting after every

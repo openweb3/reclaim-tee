@@ -15,20 +15,24 @@
 //     freshness margin (see Config.SignerCell)
 //  1. submitter identity (optional, see Config.SubmitterVerifier)
 //  2. spec structure and expiry
-//  3. body binding — the body must hash to the spec's committed digest
-//  4. policy authorisation
-//  5. body size against the policy cap
-//  6. credential resolution
-//  7. sequence allocation (see Config.Seq)
+//  3. replay identity — a job ID the enclave has already seen inside its own
+//     window is refused, since a spec is signed by nobody and a captured
+//     request is otherwise replayable until it expires (see replay.go)
+//  4. body binding — the body must hash to the spec's committed digest
+//  5. policy authorisation
+//  6. body size against the policy cap
+//  7. credential resolution
+//  8. sequence allocation (see Config.Seq)
 //
 // Steps 2 and 3 establish that the job is internally consistent; only then is
 // it meaningful to ask whether it is permitted. Authorising a request whose
 // body does not match its own description would spend a credential on a
 // question nobody asked.
 //
-// Step 7 is last because it is the only step that mutates state. Every check
-// that can refuse a job runs first, so a refused job never consumes a sequence
-// number and never leaves a hole in the provider's series.
+// Step 8 is last because it is the only step that mutates state outside the
+// replay table. Every check that can refuse a job runs first, so a refused job
+// never consumes a sequence number and never leaves a hole in the provider's
+// series.
 //
 // # When a receipt exists
 //
@@ -55,6 +59,7 @@ import (
 	"time"
 
 	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
@@ -79,6 +84,14 @@ var (
 // concurrent executions having their payloads crossed, and against a body
 // truncated in transit being sent under a spec that described the whole thing.
 var ErrBodyMismatch = errors.New("request body does not match the hash committed in the job spec")
+
+// ErrJobReplayed means this job ID has already been submitted inside the
+// window its own spec was valid for. The spec carries no submitter signature,
+// so the bytes of a captured job are a valid job; the enclave refusing to run
+// one twice is what keeps a lift off the wire from spending a provider's quota
+// a second time. A caller that wants the same work done again must ask for a
+// new job.
+var ErrJobReplayed = errors.New("job ID has already been submitted")
 
 // ErrNoSessionSupport means the configured transport can run request/response
 // exchanges but not streaming sessions. It is a wiring mismatch surfaced lazily
@@ -106,9 +119,15 @@ var ErrAttestationStale = errors.New("attested epoch past its freshness margin; 
 // is hashed and cited in receipts while the body may be large and is only ever
 // needed at execution time. Spec.BodyHash is what ties them together.
 type Job struct {
-	Spec jobs.Spec
-	Body []byte
+	Spec jobs.Spec `cbor:"1,keyasint"`
+	Body []byte    `cbor:"2,keyasint"`
 }
+
+// EncodeCanonical returns the deterministic CBOR encoding of the job. It is the
+// wire form too: /v1/execute and /v1/session both carry exactly this object
+// (canonical Job, keys 1 and 2), so the bytes a caller submits and the value the
+// service checks are one and the same.
+func (j Job) EncodeCanonical() ([]byte, error) { return canonical.Marshal(j) }
 
 // Result is the outcome of an executed job.
 //
@@ -213,6 +232,7 @@ type Service struct {
 	requestTimeout  time.Duration
 	submitterVerify func(ctx context.Context, spec jobs.Spec) error
 	inbox           *InboxKey
+	replay          *replayGuard
 }
 
 // NewService validates a configuration and returns a ready service.
@@ -246,6 +266,7 @@ func NewService(cfg Config) (*Service, error) {
 		requestTimeout:  cfg.RequestTimeout,
 		submitterVerify: cfg.SubmitterVerifier,
 		inbox:           cfg.InboxKey,
+		replay:          newReplayGuard(),
 	}, nil
 }
 
@@ -306,8 +327,50 @@ func signerStaleAt(signer *proof.Signer, now time.Time) bool {
 // `if err != nil { return }` and take the evidence with it. The invariant is
 // therefore that error is non-nil if and only if Result is nil.
 func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onStart ...StartFunc) (*Result, error) {
-	now := s.clock()
+	adm, err := s.admit(ctx, job, s.clock(), false)
+	if err != nil {
+		return nil, err
+	}
 
+	request := Request{
+		Method:           job.Spec.Method,
+		Provider:         job.Spec.Provider,
+		Host:             job.Spec.Host,
+		Path:             job.Spec.Path,
+		Query:            job.Spec.Query,
+		Headers:          adm.headers,
+		Body:             job.Body,
+		Stream:           job.Spec.Stream,
+		MaxResponseBytes: adm.decision.MaxResponseBytes,
+		Timeout:          s.requestTimeout,
+	}
+
+	return s.perform(ctx, request, job.Spec, adm.specHash, adm.decision, adm.seq, onChunk, onStart)
+}
+
+// admission is what the ordered checks every job passes produce: the hash of
+// the spec that was checked, the policy decision that authorized it, the
+// credential headers to put on the wire, and the sequence number its receipt
+// will carry.
+type admission struct {
+	specHash [32]byte
+	decision policy.Decision
+	headers  map[string]string
+	seq      uint64
+}
+
+// admit runs the checks that stand between a submitted job and the wire, in the
+// order the package doc fixes, and allocates what the exchange will need. It is
+// the single implementation of that order for both shapes a job can take — a
+// request and a streaming session — so the two cannot drift about what is
+// checked when; forSession selects the shape-specific half.
+//
+// Nothing here has a side effect a refusal should not spend. The sequence
+// number is allocated last, after every check that can refuse, so a refused job
+// never leaves a hole in the provider's series; and a job the enclave declines
+// is recorded in the replay table anyway (see replay.go), because a spec is
+// signed by nobody and a refusal replayed is a refusal earned again.
+func (s *Service) admit(ctx context.Context, job Job, now time.Time, forSession bool) (*admission, error) {
 	// Freshness before everything: a stale epoch can attest nothing, so the
 	// job is refused before it can spend provider work or a sequence number.
 	if signerStaleAt(s.activeSigner(), now) {
@@ -325,6 +388,12 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onSta
 		return nil, err
 	}
 
+	// Then replay: a job ID already seen inside its own window is refused
+	// before a credential is touched or a sequence number is spent.
+	if !s.replay.spend(job.Spec.JobID, now, time.Unix(job.Spec.ExpiresAt, 0)) {
+		return nil, fmt.Errorf("%w: %x", ErrJobReplayed, job.Spec.JobID)
+	}
+
 	// The body must be the body the spec describes. This is what catches two
 	// concurrent jobs having their payloads crossed, or a truncated body
 	// arriving under another job's authorisation.
@@ -332,12 +401,24 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onSta
 		return nil, ErrBodyMismatch
 	}
 
+	// A session is a handshake, not a payload: it commits to an empty body and
+	// says so in the spec. A request's body is a payload and must fit the cap
+	// the policy sets, which is only known once it has authorized the job.
+	if forSession {
+		if len(job.Body) != 0 {
+			return nil, fmt.Errorf("%w: got %d bytes", ErrSessionBody, len(job.Body))
+		}
+		if !job.Spec.Session {
+			return nil, fmt.Errorf("%w: Spec.Session is false", ErrSessionBody)
+		}
+	}
+
 	decision, err := s.policy.AuthorizeAt(job.Spec, now)
 	if err != nil {
 		return nil, err
 	}
 
-	if uint64(len(job.Body)) > decision.MaxBodyBytes {
+	if !forSession && uint64(len(job.Body)) > decision.MaxBodyBytes {
 		return nil, fmt.Errorf("%w: %d bytes, limit %d",
 			ErrBodyTooLarge, len(job.Body), decision.MaxBodyBytes)
 	}
@@ -368,20 +449,7 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onSta
 		return nil, fmt.Errorf("allocate provider sequence: %w", err)
 	}
 
-	request := Request{
-		Method:           job.Spec.Method,
-		Provider:         job.Spec.Provider,
-		Host:             job.Spec.Host,
-		Path:             job.Spec.Path,
-		Query:            job.Spec.Query,
-		Headers:          headers,
-		Body:             job.Body,
-		Stream:           job.Spec.Stream,
-		MaxResponseBytes: decision.MaxResponseBytes,
-		Timeout:          s.requestTimeout,
-	}
-
-	return s.perform(ctx, request, job.Spec, specHash, decision, seq, onChunk, onStart)
+	return &admission{specHash: specHash, decision: decision, headers: headers, seq: seq}, nil
 }
 
 // injectCredential decrypts the credential envelope carried on the job and
@@ -438,6 +506,27 @@ func (s *Service) injectCredential(spec jobs.Spec) (map[string]string, error) {
 	}
 	headers[name] = value
 	return headers, nil
+}
+
+// receiptFor fills the fields every receipt shares: which job it describes,
+// which policy authorized it, where it sits in the provider's series, and the
+// model it was priced as. It exists so that a field common to both shapes — a
+// request and a streaming session — is written once, instead of in whichever of
+// the two receipt constructions the author remembered (see perform and
+// Session.Receipt, which add what is specific to how the job ran).
+func receiptFor(spec jobs.Spec, specHash [32]byte, decision policy.Decision, seq uint64) proof.Receipt {
+	return proof.Receipt{
+		Version:     proof.VersionV1,
+		JobID:       spec.JobID,
+		JobSpecHash: specHash[:],
+		Provider:    spec.Provider,
+		Method:      spec.Method,
+		Host:        spec.Host,
+		Path:        spec.Path,
+		PolicyHash:  decision.PolicyHash,
+		ProviderSeq: seq,
+		Model:       spec.Model,
+	}
 }
 
 // perform sends the request, digests the response as it arrives, and signs the
@@ -555,40 +644,25 @@ func (s *Service) perform(
 	}
 
 	streamHash := hasher.Sum()
-	receipt := proof.Receipt{
-		Version:       proof.VersionV1,
-		JobID:         spec.JobID,
-		JobSpecHash:   specHash[:],
-		Provider:      spec.Provider,
-		Method:        spec.Method,
-		Host:          spec.Host,
-		Path:          spec.Path,
-		StatusCode:    statusCode,
-		StreamHash:    streamHash[:],
-		ChunkCount:    totalChunks,
-		ResponseBytes: totalBytes,
-		Completion:    completion,
-		StartedAt:     startedAt,
-		FinishedAt:    finishedAt,
-		PolicyHash:    decision.PolicyHash,
+	receipt := receiptFor(spec, specHash, decision, seq)
+	receipt.StatusCode = statusCode
+	receipt.StreamHash = streamHash[:]
+	receipt.ChunkCount = totalChunks
+	receipt.ResponseBytes = totalBytes
+	receipt.Completion = completion
+	receipt.StartedAt = startedAt
+	receipt.FinishedAt = finishedAt
 
-		// The request side of the exchange. The size was already computed to
-		// check it against the policy cap; signing it costs nothing and is the
-		// only attested record of how much was sent, since the body itself
-		// appears in the receipt only as a hash.
-		RequestBytes: uint64(len(request.Body)),
+	// The request side of the exchange. The size was already computed to check
+	// it against the policy cap; signing it costs nothing and is the only
+	// attested record of how much was sent, since the body itself appears in
+	// the receipt only as a hash.
+	receipt.RequestBytes = uint64(len(request.Body))
 
-		// Where this execution sits in the provider's series. A provider
-		// holding a receipt numbered N knows it was used at least N times,
-		// which is what turns a pile of individually-valid receipts into a
-		// ledger whose completeness can be checked.
-		ProviderSeq: seq,
-
-		// The response start the Hub was shown. Present exactly when the
-		// exchange produced a response, which is also exactly when the Hub can
-		// hold this receipt against the status and headers it relayed.
-		ResponseHeadersHash: headerHash,
-	}
+	// The response start the Hub was shown. Present exactly when the exchange
+	// produced a response, which is also exactly when the Hub can hold this
+	// receipt against the status and headers it relayed.
+	receipt.ResponseHeadersHash = headerHash
 
 	signed, err := signer.Sign(receipt)
 	if err != nil {
@@ -669,46 +743,9 @@ type Session struct {
 // sees them.
 func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 	now := s.clock()
-
-	// Same freshness refusal as Execute, before the sequence or the provider
-	// handshake is spent.
-	if signerStaleAt(s.activeSigner(), now) {
-		return nil, ErrAttestationStale
-	}
-
-	if s.submitterVerify != nil {
-		if err := s.submitterVerify(ctx, job.Spec); err != nil {
-			return nil, fmt.Errorf("submitter rejected: %w", err)
-		}
-	}
-	if err := job.Spec.ValidateAt(now); err != nil {
-		return nil, err
-	}
-	if !job.Spec.MatchesBody(job.Body) {
-		return nil, ErrBodyMismatch
-	}
-	if len(job.Body) != 0 {
-		return nil, fmt.Errorf("%w: got %d bytes", ErrSessionBody, len(job.Body))
-	}
-	if !job.Spec.Session {
-		return nil, fmt.Errorf("%w: Spec.Session is false", ErrSessionBody)
-	}
-
-	decision, err := s.policy.AuthorizeAt(job.Spec, now)
+	adm, err := s.admit(ctx, job, now, true)
 	if err != nil {
 		return nil, err
-	}
-	headers, err := s.injectCredential(job.Spec)
-	if err != nil {
-		return nil, err
-	}
-	specHash, err := job.Spec.Hash()
-	if err != nil {
-		return nil, err
-	}
-	seq, err := s.seq.Next([]byte(job.Spec.Provider))
-	if err != nil {
-		return nil, fmt.Errorf("allocate provider sequence: %w", err)
 	}
 
 	opener, ok := s.transport.(SessionOpener)
@@ -730,7 +767,7 @@ func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 		Host:     job.Spec.Host,
 		Path:     job.Spec.Path,
 		Query:    job.Spec.Query,
-		Headers:  headers,
+		Headers:  adm.headers,
 		Stream:   true,
 		Timeout:  s.requestTimeout,
 	}
@@ -742,9 +779,9 @@ func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 	return &Session{
 		svc:       s,
 		spec:      job.Spec,
-		specHash:  specHash,
-		decision:  decision,
-		seq:       seq,
+		specHash:  adm.specHash,
+		decision:  adm.decision,
+		seq:       adm.seq,
 		conn:      conn,
 		hasher:    proof.NewStreamingHasher(job.Spec.JobID),
 		started:   now.Unix(),
@@ -850,25 +887,15 @@ func (s *Session) Receipt() (*Result, error) {
 		completion = proof.CompletionTruncated
 	}
 	streamHash := s.hasher.Sum()
-	receipt := proof.Receipt{
-		Version:       proof.VersionV1,
-		JobID:         s.spec.JobID,
-		JobSpecHash:   s.specHash[:],
-		Provider:      s.spec.Provider,
-		Method:        s.spec.Method,
-		Host:          s.spec.Host,
-		Path:          s.spec.Path,
-		StatusCode:    101,
-		StreamHash:    streamHash[:],
-		ChunkCount:    s.chunkCount,
-		ResponseBytes: s.responseBytes,
-		Completion:    completion,
-		StartedAt:     s.started,
-		FinishedAt:    s.finishedAt,
-		PolicyHash:    s.decision.PolicyHash,
-		RequestBytes:  s.requestBytes,
-		ProviderSeq:   s.seq,
-	}
+	receipt := receiptFor(s.spec, s.specHash, s.decision, s.seq)
+	receipt.StatusCode = 101
+	receipt.StreamHash = streamHash[:]
+	receipt.ChunkCount = s.chunkCount
+	receipt.ResponseBytes = s.responseBytes
+	receipt.Completion = completion
+	receipt.StartedAt = s.started
+	receipt.FinishedAt = s.finishedAt
+	receipt.RequestBytes = s.requestBytes
 	// The session may have outlived the rotation it opened under: sign with
 	// whatever the process serves now, so a long session still finishes under
 	// fresh evidence instead of the expired key it started with. If even that

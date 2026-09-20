@@ -41,6 +41,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -114,6 +115,16 @@ func main() {
 			log.Fatalf("emit policy dir: %v", err)
 		}
 		return
+	}
+	// The Hub-facing API spends provider credentials and allocates ProviderSeq
+	// numbers, and in the clear it authenticates nothing: /v1/execute trusts
+	// whoever asks and /v1/credential-key hands out the inbox key to whoever
+	// asks. Serving that beyond this host needs -mtls, which demands a Hub
+	// client certificate; anything else keeps it on loopback.
+	if !*serveMTLS {
+		if err := requireCleartextLoopback(*addr); err != nil {
+			log.Fatalf("%v; serve -mtls to expose the Hub-facing API beyond this host", err)
+		}
 	}
 	if resolved, err := shared.ResolvePolicyDir(*policyDir, *platformName == "sevsnp"); err != nil {
 		// On the SNP path the whitelist is part of the measured bundle and its
@@ -338,6 +349,25 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// requireCleartextLoopback refuses to serve the TEE's plaintext Hub-facing API
+// on an address reachable beyond this host. The listener authenticates nothing
+// without -mtls, so anything that can open a socket to it can submit jobs,
+// spend a provider's sequence numbers out of band, and use the enclave as an
+// egress proxy; keeping it on loopback is what makes that a local-only concern.
+func requireCleartextLoopback(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("parse listen address %q: %w", addr, err)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("refusing to serve the plaintext TEE API on non-loopback address %q", addr)
 }
 
 // relayHeaders builds the headers the TEE presents when dialing the Hub's
