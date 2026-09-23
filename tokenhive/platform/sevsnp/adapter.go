@@ -28,11 +28,11 @@ type Config struct {
 // Adapter keeps admission, evidence, and signing on a verified RA-TLS epoch.
 //
 // Admission is derived from the epoch itself — what it is serving and whether
-// that epoch's evidence is still outside the refresh margin — rather than from
-// a flag a refresh flips. A rotation therefore never interrupts service: it
-// swaps one verified epoch for the next in a single assignment, and the epoch
-// it replaces stays admissible until its own margin, which is exactly the point
-// at which a verifier would stop accepting it.
+// that epoch's evidence is still within its own validity — rather than from a
+// flag a refresh flips. A rotation therefore never interrupts service: it swaps
+// one verified epoch for the next in a single assignment, and the epoch it
+// replaces stays admissible until its own NitroTPM leaf expires, which is
+// exactly the point at which a verifier would stop accepting it.
 type Adapter struct {
 	manager ratlsManager
 	baseTLS *tls.Config
@@ -109,9 +109,10 @@ func newAWS(ctx context.Context, config Config, deps dependencies) (*Adapter, er
 
 // Healthy reports whether new trusted work and TLS handshakes may be admitted.
 // It is true exactly while the adapter holds an epoch whose evidence is still
-// outside its margin, so a failed rotation shows up here at the margin — when
-// the served evidence is no longer worth presenting — and not from the start of
-// the attempt.
+// inside the validity of its own NitroTPM leaf, so a failed rotation shows up
+// here only once the evidence has actually expired — not when it is merely
+// older than the schedule wanted, which is a state the listener can keep
+// serving without any verifier objecting.
 func (a *Adapter) Healthy() bool {
 	if a == nil {
 		return false
@@ -120,7 +121,7 @@ func (a *Adapter) Healthy() bool {
 }
 
 // admitted returns the epoch the adapter is serving, or nil when it holds none
-// or the one it holds has reached its margin.
+// or the one it holds has run out of validity.
 func (a *Adapter) admitted() *epoch {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -129,15 +130,18 @@ func (a *Adapter) admitted() *epoch {
 
 // served is admitted's body, for callers already holding a.mu.
 func (a *Adapter) served() *epoch {
-	if a.current == nil || !a.current.fresh() {
+	if a.current == nil || !a.current.admissible() {
 		return nil
 	}
 	return a.current
 }
 
 // ServerTLSConfig returns an RA-TLS server configuration whose certificate
-// admission fails closed once the served epoch's evidence reaches the refresh
-// margin — never merely because a rotation is in progress.
+// admission fails closed once the served epoch's NitroTPM leaf has expired —
+// never merely because a rotation is in progress. Handshakes are admitted for
+// exactly as long as a verifier would accept the certificate presented, which
+// is what keeps a rotation that has not yet found newer evidence from becoming
+// an outage of its own.
 func (a *Adapter) ServerTLSConfig() *tls.Config {
 	config := a.baseTLS.Clone()
 	config.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -171,16 +175,25 @@ func (a *Adapter) Snapshot(ctx context.Context) (platform.Epoch, error) {
 	return served, nil
 }
 
-// Refresh rotates the RA-TLS key and evidence and publishes the new epoch in
-// one step. The epoch it replaces keeps serving until then, because it is still
-// outside its margin — the rotation is scheduled with room to spare — so
-// refusing new handshakes for the duration of an attestation call would drop
-// traffic to prove nothing.
+// Refresh rotates the RA-TLS key and evidence and publishes the new epoch if it
+// moves admission further out. The epoch being replaced keeps serving until
+// then, because its own evidence is still valid — the rotation is scheduled with
+// room to spare — so refusing new handshakes for the duration of an attestation
+// call would drop traffic to prove nothing.
+//
+// Publishing only newer evidence matters routinely, not just in principle: AWS
+// reissues the NitroTPM leaf only in the last minutes of its life, so a rotation
+// that lands earlier regenerates the key and is handed back the certificate
+// already in service. Installing that would swap evidence that still has hours
+// of validity for evidence that expires at the very same instant, and would
+// retire every live connection to do it. The epoch stays, and the tick returns
+// nil: it is a rotation the platform declined, not a failure, and the epoch it
+// declined to replace is still being served.
 //
 // A rotation that fails leaves the previous epoch in place and admits from it
-// until its margin; the failure reads as a rotation that did not happen. A
-// rotation that succeeds swaps the epoch, and admission follows the new one
-// automatically, with no window in between for a reader to glimpse a
+// until its own evidence expires; the failure reads as a rotation that did not
+// happen. A rotation that succeeds swaps the epoch, and admission follows the
+// new one automatically, with no window in between for a reader to glimpse a
 // half-rotated state.
 func (a *Adapter) Refresh(ctx context.Context) error {
 	select {
@@ -200,26 +213,40 @@ func (a *Adapter) Refresh(ctx context.Context) error {
 		return fmt.Errorf("verify refreshed AWS SEV-SNP epoch: %w", err)
 	}
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !next.supersedes(a.current) {
+		return nil
+	}
 	a.current = next
-	a.mu.Unlock()
 	return nil
 }
 
 type epoch struct {
 	identity platform.Identity
 	snapshot ratlsSnapshot
-	// freshUntil is when this epoch's evidence enters the refresh margin:
-	// SNPRefreshMargin before the NitroTPM leaf's NotAfter, or the fixed TTL for
-	// evidence without a short-lived leaf. Reading it once here keeps admission
-	// from re-parsing the attestation on every handshake.
-	freshUntil time.Time
+	// admissibleUntil is when this epoch stops being presentable: the NitroTPM
+	// leaf's own NotAfter, which is the instant a verifier stops accepting it.
+	// Reading it once here keeps admission from re-parsing the attestation on
+	// every handshake. Signing has its own, earlier deadline (the shared
+	// SNPSigningDeadline the service applies), because a receipt outlives the
+	// handshake that carried it while a certificate does not.
+	admissibleUntil time.Time
 }
 
-// fresh reports whether the epoch's evidence is still outside the margin a
-// verifier expects. It is the adapter's whole admission rule: an epoch is
-// served exactly while its own evidence is fresh, so no mutable flag can
-// disagree with what the listener presents.
-func (e *epoch) fresh() bool { return time.Now().Before(e.freshUntil) }
+// admissible reports whether the epoch's evidence may still be presented. It is
+// the adapter's whole admission rule: an epoch is served exactly while its own
+// evidence is valid, so no mutable flag can disagree with what the listener
+// presents.
+func (e *epoch) admissible() bool { return time.Now().Before(e.admissibleUntil) }
+
+// supersedes reports whether e moves admission further out than previous, which
+// is the condition for replacing it. The comparison is on the deadline rather
+// than on "a rotation happened", so evidence that expires no later than the
+// evidence already in service can never displace it — a refresh must buy the
+// listener time, and one that does not is a rotation the platform declined.
+func (e *epoch) supersedes(previous *epoch) bool {
+	return previous == nil || e.admissibleUntil.After(previous.admissibleUntil)
+}
 
 func buildEpoch(snapshot ratlsSnapshot) (*epoch, error) {
 	if snapshot == nil || snapshot.Certificate() == nil {
@@ -261,10 +288,14 @@ func buildEpoch(snapshot ratlsSnapshot) (*epoch, error) {
 		PublicKeyDER:    append([]byte(nil), publicKeyDER...),
 		KeyID:           keyID,
 	}
+	// The deadline is the leaf's own NotAfter, or the fixed fallback for
+	// evidence that carries no readable leaf; the flag is not needed here
+	// because admission uses the value either way.
+	deadline, _ := shared.SNPAdmissionDeadline(evidence)
 	return &epoch{
-		identity:   identity,
-		snapshot:   snapshot,
-		freshUntil: shared.SNPAttestationExpiry(evidence),
+		identity:        identity,
+		snapshot:        snapshot,
+		admissibleUntil: deadline,
 	}, nil
 }
 

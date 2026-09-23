@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
@@ -164,6 +166,99 @@ func TestHTTPFetcherRefusesWrongBytes(t *testing.T) {
 	if _, err := f.Fetch(context.Background(), id); err == nil {
 		t.Fatal("Fetch accepted evidence that does not match the requested hash")
 	}
+}
+
+// TestHTTPFetcherRetriesARetiredConnection: /v1/evidence is served by the same
+// listener as /v1/execute, so a rotation can refuse it on the same connection.
+// This fetch happens once per hash-only receipt, on the settlement path, so a
+// refusal left to the caller is a verified job thrown away after the provider
+// already ran. The retry must ask for a connection of its own: every pooled
+// connection to a rotating TEE is one a rotation may have retired.
+func TestHTTPFetcherRetriesARetiredConnection(t *testing.T) {
+	s, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	id := idWith([]byte("serve-me"))
+	if err := s.Put(id); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	var hits int32
+	recorder := &attemptRecorder{base: http.DefaultTransport}
+	mux := http.NewServeMux()
+	NewHTTPServer(s, mux)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			http.Error(w, "connection belongs to a retired attestation epoch; reconnect", http.StatusServiceUnavailable)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	f, err := NewHTTPFetcher(server.URL, &http.Client{Transport: recorder})
+	if err != nil {
+		t.Fatalf("NewHTTPFetcher: %v", err)
+	}
+	got, err := f.Fetch(context.Background(), id)
+	if err != nil {
+		t.Fatalf("a retired connection reached the verifier as a failure: %v", err)
+	}
+	if string(got) != "serve-me" {
+		t.Fatalf("Fetch = %q, want serve-me", got)
+	}
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Fatalf("peer saw %d attempts, want 2 (one refusal, one retry)", n)
+	}
+	if got := recorder.attempts(); len(got) != 2 || got[0] || !got[1] {
+		t.Fatalf("attempts asked for their own connection %v, want [false true]", got)
+	}
+}
+
+// TestHTTPFetcherSurfacesAPeerThatKeepsRefusing bounds the retry: a peer
+// answering 503 forever is down, not rotating, and the caller must be told
+// rather than looped on.
+func TestHTTPFetcherSurfacesAPeerThatKeepsRefusing(t *testing.T) {
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	id := platform.Identity{EvidenceHash: sha256.Sum256([]byte("expected"))}
+	f, _ := NewHTTPFetcher(server.URL, nil)
+	if _, err := f.Fetch(context.Background(), id); err == nil {
+		t.Fatal("Fetch reported success against a peer that only refused")
+	}
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Fatalf("peer saw %d attempts, want exactly 2", n)
+	}
+}
+
+// attemptRecorder records, per attempt, whether the client asked for a
+// connection of its own rather than one out of its pool. A retry that reused a
+// pooled connection would be refused again by the same listener, so this is the
+// difference between recovering from a rotation and appearing to.
+type attemptRecorder struct {
+	base http.RoundTripper
+
+	mu         sync.Mutex
+	perAttempt []bool
+}
+
+func (r *attemptRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	r.perAttempt = append(r.perAttempt, req.Close)
+	r.mu.Unlock()
+	return r.base.RoundTrip(req)
+}
+
+func (r *attemptRecorder) attempts() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]bool(nil), r.perAttempt...)
 }
 
 func TestChainFallsThroughToNext(t *testing.T) {

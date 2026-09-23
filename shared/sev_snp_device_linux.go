@@ -38,12 +38,20 @@ func GenerateCombinedGCPAttestation(spkiDER, appHash []byte) ([]byte, error) {
 // this serialization for free via the launcher socket.
 var snpAttestMu sync.Mutex
 
-// SEV-SNP attestations bind the stable RA-TLS SPKI / signing key (the keypair
-// never rotates for the life of the process), so regenerating one on every cert
-// refresh (~4 min) and per-claim cache miss just re-hammers the TPM — on AWS the
-// NitroTPM doc generation is CPU-heavy enough to hog the kernel's tpm workqueue.
-// Cache by the bound data and reuse; the doc has no freshness/challenge, and the
-// attestor verifies the key-binding, not recency. Guarded by snpAttestMu.
+// SEV-SNP attestations bind the RA-TLS SPKI / signing key that is current when
+// they are generated. That key is rotated on every RA-TLS refresh
+// (RATLSManager.Refresh generates a fresh keypair), not held for the life of the
+// process — so an attestation is valid for exactly one key and one refresh
+// interval. Keying the cache on the bound data is what keeps that honest: a
+// rotation changes the key material, hence the cache key, so a rotated
+// deployment can never be handed a document certifying the key it just retired.
+//
+// Within one key's life the document is worth reusing rather than regenerating
+// per claim. It carries no freshness/challenge of its own — the attestor
+// verifies the key binding and the image identity, not recency — while
+// regenerating it is expensive: on AWS, NitroTPM document generation is
+// CPU-heavy enough to hog the kernel's tpm workqueue. Cache by the bound data
+// and reuse for snpAttestCacheTTL. Guarded by snpAttestMu.
 const snpAttestCacheTTL = 50 * time.Minute
 
 type snpAttestCacheEntry struct {

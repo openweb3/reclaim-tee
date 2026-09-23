@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,6 +49,16 @@ const (
 	// case loses the reason; they are deliberately distinct.
 	EventError = "error"
 
+	// EpochRetiredHeader marks the one 503 a TEE sends on purpose: the request
+	// arrived over a connection whose attested epoch a rotation has already
+	// replaced. It exists so a client can tell that refusal from any other 503
+	// and retry it — safely, because the listener answers it before the service
+	// allocates a sequence number, spends a credential, or reaches a provider,
+	// and before a single byte reaches an onChunk callback. Both halves of the
+	// interface meet it: the Hub's client for /v1/execute, and every agent
+	// fetching /v1/credential-key.
+	EpochRetiredHeader = "X-TokenHive-Epoch-Retired"
+
 	// MaxExecuteBody bounds the canonical-CBOR ExecuteRequest the TEE will
 	// read. A job spec plus its request body is small; a caller declaring a
 	// gigabyte is not submitting a job, it is attempting to exhaust the
@@ -61,6 +72,15 @@ const (
 	// whole life.
 	executeReadTimeout = 30 * time.Second
 )
+
+// ErrEpochRetired is the refusal above as an error value, so a client can act
+// on it without re-reading a status and a header — and so neither half of the
+// interface has to recognise it by parsing a message. It is exported because
+// both halves meet it: the Hub's client for /v1/execute, and every agent
+// fetching its inbox key. Retrying it is safe by construction rather than by
+// judgement, which is the entire reason the marker exists: an unmarked 503
+// could have been answered after the job had already executed.
+var ErrEpochRetired = errors.New("tee retired the attestation epoch this connection belongs to")
 
 // startFrame is the JSON payload of an EventStart frame. Headers are a map so
 // the encoding matches Go's http.Header shape; values keep the order the

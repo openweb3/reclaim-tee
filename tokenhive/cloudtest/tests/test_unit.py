@@ -10,9 +10,12 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "snp"))
 
 import config as config_mod
 import aws
+import crosshost
+import retire as retire_mod
 from config import Config
 
 
@@ -409,6 +412,202 @@ class WaitTerminatedTest(unittest.TestCase):
             aws.wait_terminated(self.fake, ids, timeout=30)  # must not raise
         finally:
             aws.time.sleep = orig
+
+
+class OwnershipTest(unittest.TestCase):
+    """A recorded instance may only be adopted when it can still serve."""
+
+    def test_only_pending_and_running_are_adoptable(self):
+        rec = {"instance_id": "i-1"}
+        for st in crosshost.REUSABLE_STATES:
+            self.assertTrue(crosshost.adoptable(rec, st), st)
+        for st in ("shutting-down", "stopping", "stopped", "terminated", ""):
+            self.assertFalse(crosshost.adoptable(rec, st), st)
+
+    def test_record_naming_no_instance_is_never_adoptable(self):
+        self.assertFalse(crosshost.adoptable({}, "running"))
+        self.assertFalse(crosshost.adoptable(None, "running"))
+
+    def test_shutting_down_record_is_not_adopted(self):
+        # The 2026-09-22 trap: `down` then `up` while the old tee was still
+        # shutting down made `up` adopt it — no launch, and the new app digest
+        # stamped onto a machine seconds from vanishing.
+        fake = FakeEC2()
+        inst = fake.add_instance(
+            {"tokenhive-TEE": "true", "user": "chenxinghao"}, "shutting-down")
+        rec = {"instance_id": inst["InstanceId"], "role": "tee"}
+        st = crosshost.recorded_state(fake, rec)
+        self.assertEqual(st, "shutting-down")
+        self.assertFalse(crosshost.adoptable(rec, st))
+
+    def test_absent_instance_reads_as_not_adoptable(self):
+        fake = FakeEC2()
+        self.assertEqual(crosshost.recorded_state(fake, {"instance_id": "i-404"}), "terminated")
+        self.assertFalse(crosshost.adoptable({"instance_id": "i-404"}, "terminated"))
+        self.assertEqual(crosshost.recorded_state(fake, {}), "")
+
+
+class _Boom(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
+class _RaisingEC2:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def describe_instances(self, InstanceIds):
+        raise self.exc
+
+
+class DescribeAbsenceTest(unittest.TestCase):
+    def test_not_found_reads_as_absent(self):
+        # Past AWS' retention window a purged instance is not "an empty result"
+        # but an InvalidInstanceID error, and the caller is deciding whether a
+        # recorded machine still exists — a traceback there is not an answer.
+        ec2 = _RaisingEC2(_Boom("InvalidInstanceID.NotFound"))
+        self.assertEqual(crosshost.describe(ec2, "i-gone"), {})
+        self.assertEqual(crosshost.host_state(ec2, "i-gone"), "terminated")
+
+    def test_other_failures_surface(self):
+        for code in ("UnauthorizedOperation", "RequestLimitExceeded", ""):
+            ec2 = _RaisingEC2(_Boom(code))
+            with self.assertRaises(_Boom):
+                crosshost.describe(ec2, "i-1")
+
+
+class SupersedeTest(unittest.TestCase):
+    def test_supersede_keeps_the_old_record_intact(self):
+        state = {"tee": {"instance_id": "i-old", "role": "tee", "private_ip": "10.0.0.9"}}
+        old = crosshost.supersede(state, "2026-09-22T13:00:00+0800")
+        self.assertEqual(old["instance_id"], "i-old")
+        # The tee slot is free for the launch that is about to replace it, and
+        # nothing else in state was touched.
+        self.assertNotIn("tee", state)
+        self.assertEqual(len(state["superseded"]), 1)
+        entry = state["superseded"][0]
+        # The record must still name the machine an operator has to terminate.
+        self.assertEqual(entry["instance_id"], "i-old")
+        self.assertEqual(entry["private_ip"], "10.0.0.9")
+        self.assertEqual(entry["superseded_at"], "2026-09-22T13:00:00+0800")
+
+    def test_supersede_without_a_record_is_a_noop(self):
+        state = {}
+        self.assertIsNone(crosshost.supersede(state, "t"))
+        self.assertNotIn("superseded", state)
+        self.assertIsNone(crosshost.supersede({"tee": {}}, "t"))
+
+    def test_every_swap_keeps_its_predecessor(self):
+        state = {"tee": {"instance_id": "i-1"}}
+        crosshost.supersede(state, "t1")
+        state["tee"] = {"instance_id": "i-2"}
+        crosshost.supersede(state, "t2")
+        self.assertEqual([e["instance_id"] for e in state["superseded"]], ["i-1", "i-2"])
+
+    def test_launcher_never_terminates_anything(self):
+        # The reciprocal half of the swap invariant: `up --new` may create and
+        # record, but no path through it can destroy the machine it replaces.
+        src = Path(__file__).resolve().parent.parent.joinpath("snp", "crosshost.py").read_text()
+        self.assertNotIn("terminate_instances", src)
+        imports = src[src.index("from aws import"):src.index(")", src.index("from aws import"))]
+        self.assertNotIn("terminate", imports)
+
+
+class RetireSafetyTest(unittest.TestCase):
+    """retire.py may terminate exactly what `up --new` recorded, and nothing else."""
+
+    def setUp(self):
+        self.fake, self.cfg = FakeEC2(), Config(user="chenxinghao")
+        tags = {"tokenhive-TEE": "true", "user": "chenxinghao"}
+        self.new = self.fake.add_instance(tags, "running", "1.0.0.1")
+        self.old = self.fake.add_instance(tags, "running", "1.0.0.2")
+        self.foreign = self.fake.add_instance(
+            {"tokenhive-TEE": "true", "user": "someone-else"}, "running", "1.0.0.3")
+        self.state = {
+            "tee": {"instance_id": self.new["InstanceId"]},
+            "superseded": [{"instance_id": self.old["InstanceId"], "superseded_at": "t0"}],
+        }
+
+    def states(self):
+        return {i["InstanceId"]: i["State"]["Name"] for i in self.fake.instances}
+
+    def retire(self, **kw):
+        return retire_mod.retire(self.fake, self.cfg, self.state, **kw)
+
+    def test_retires_only_the_recorded_superseded_instance(self):
+        summary = self.retire()
+        self.assertEqual(summary["terminated"], [self.old["InstanceId"]])
+        st = self.states()
+        self.assertEqual(st[self.old["InstanceId"]], "terminated")
+        self.assertEqual(st[self.new["InstanceId"]], "running")   # the successor stays
+        self.assertEqual(st[self.foreign["InstanceId"]], "running")  # other user's machine
+        # Its record is spent; state says so rather than inviting a second attempt.
+        self.assertNotIn("superseded", self.state)
+
+    def test_rerun_after_a_retirement_is_a_noop(self):
+        self.retire()
+        summary = self.retire()
+        self.assertEqual(summary["terminated"], [])
+        self.assertEqual(summary["rows"], [])
+
+    def test_dry_run_terminates_and_prunes_nothing(self):
+        summary = self.retire(dry_run=True)
+        self.assertEqual(summary["terminated"], [])
+        self.assertEqual([r[0] for r in summary["rows"]], [self.old["InstanceId"]])
+        self.assertEqual(self.states()[self.old["InstanceId"]], "running")
+        self.assertEqual(len(self.state["superseded"]), 1)
+
+    def test_refuses_when_no_successor_is_recorded(self):
+        del self.state["tee"]
+        with self.assertRaises(retire_mod.Refused):
+            self.retire()
+        self.assertEqual(self.states()[self.old["InstanceId"]], "running")
+
+    def test_refuses_when_successor_is_not_running(self):
+        for st in ("shutting-down", "stopped", "terminated"):
+            self.fake.instances[0]["State"]["Name"] = st
+            with self.assertRaises(retire_mod.Refused):
+                self.retire()
+            self.assertEqual(self.states()[self.old["InstanceId"]], "running")
+        self.fake.instances[0]["State"]["Name"] = "running"
+
+    def test_refuses_a_record_that_names_the_current_tee(self):
+        self.state["superseded"] = [{"instance_id": self.new["InstanceId"]}]
+        with self.assertRaises(retire_mod.Refused):
+            self.retire()
+        self.assertEqual(self.states()[self.new["InstanceId"]], "running")
+
+    def test_refuses_a_record_that_names_the_host(self):
+        self.state["host"] = {"instance_id": self.old["InstanceId"]}
+        with self.assertRaises(retire_mod.Refused):
+            self.retire()
+        self.assertEqual(self.states()[self.old["InstanceId"]], "running")
+
+    def test_refuses_an_untagged_record(self):
+        self.state["superseded"] = [{"instance_id": self.foreign["InstanceId"]}]
+        with self.assertRaises(retire_mod.Refused):
+            self.retire()
+        self.assertEqual(self.states()[self.foreign["InstanceId"]], "running")
+
+    def test_gone_instance_is_pruned_not_terminated(self):
+        self.state["superseded"] = [{"instance_id": "i-gone"}]
+        summary = self.retire()
+        self.assertEqual(summary["terminated"], [])
+        self.assertEqual([r[1] for r in summary["rows"]], ["gone"])
+        self.assertNotIn("superseded", self.state)
+
+    def test_no_records_means_no_work(self):
+        self.state = {"tee": {"instance_id": self.new["InstanceId"]}}
+        summary = self.retire()
+        self.assertEqual(summary["rows"], [])
+        self.assertEqual(summary["terminated"], [])
+
+    def test_retire_never_enumerates_by_tag(self):
+        src = Path(__file__).resolve().parent.parent.joinpath("snp", "retire.py").read_text()
+        self.assertNotIn("find_by_tags", src)
+        self.assertNotIn("describe_instances", src)
+        self.assertNotIn("Filters", src)
 
 
 class StructureTest(unittest.TestCase):

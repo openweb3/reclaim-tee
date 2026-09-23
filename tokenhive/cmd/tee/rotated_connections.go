@@ -6,17 +6,31 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // epochConnections retires the connections a rotation leaves behind.
 //
 // A rotation replaces the key this process signs receipts with, but it does not
 // replace the certificate an already-established TLS connection presented: that
-// was fixed at its handshake. A verifier that binds a receipt to the connection
-// that carried it — which is the whole point of RA-TLS, and what the Hub does —
-// then sees a receipt naming the rotated key arrive over a certificate carrying
-// the previous one, and is right to refuse the pair. Nothing is wrong with
-// either half; they simply belong to different epochs.
+// was fixed at its handshake. A new request put on such a connection would be
+// served by an epoch the process has already left, so it is refused and the peer
+// is told to reconnect — cheaper than executing a request the process is in the
+// middle of rotating out from under.
+//
+// This is not what makes a receipt trustworthy, and it is not a pairing check.
+// Nothing here compares a receipt to the connection that carried it: this Hub
+// pins the attested application on both halves rather than comparing them to
+// each other — the handshake under -tee-verify=attestation and the receipt
+// verifier both check -expected-app — and the service keeps the pairing only
+// where keeping it is free. An exchange admitted under one epoch and signed
+// under the next is settled with the newer key rather than abandoned (see
+// Service.perform), and a session that outlives a rotation is signed the same
+// way (see Session.Receipt), so a receipt may well name a later key than the
+// connection it arrives on. What remains here is the narrower invariant that
+// costs nothing: no request is served over a connection the process has stopped
+// signing for.
 //
 // The connection is the part that can be retired, so it is, in two steps that
 // cover each other:
@@ -31,11 +45,10 @@ import (
 //     otherwise the moment they fall idle — so the refusal above stays a
 //     backstop rather than something a peer meets on the normal path.
 //
-// A request already in flight when the rotation lands is a different case and
-// is handled in the service, which pins the signer an execution started under
-// (see Service.perform) so the receipt matches the certificate it is answering
-// over. Cutting such a request here would turn an answer this process is still
-// able to produce correctly into a failure.
+// A request already in flight when the rotation lands is not cut here: the
+// service prefers the signer the exchange started under and falls back to the
+// live one when that signer has run out of room, so cutting it would turn an
+// answer this process is still able to produce and attest into a failure.
 type epochConnections struct {
 	// current is the epoch this process signs under, counted rather than named:
 	// what matters is only whether a connection predates it. It is read on every
@@ -70,9 +83,16 @@ func (e *epochConnections) accept(ctx context.Context, c net.Conn) context.Conte
 
 // guard refuses a request that reached this process over a connection from an
 // earlier epoch, before the service can spend a sequence number, a credential
-// or an upstream exchange on a receipt the Hub would refuse anyway. Answering
-// 503 says what is true — this connection is retired, open another — and costs
-// the peer a reconnect rather than a request it was charged for.
+// or an upstream exchange on bytes this process is already rotating away from.
+// Answering 503 says what is true — this connection is retired, open another —
+// and costs the peer a reconnect rather than a request it was charged for.
+//
+// The 503 carries tee.EpochRetiredHeader so the Hub can tell this refusal from
+// any other 503 and retry it on a fresh connection. Without the marker a Hub
+// could only guess, and guessing wrong is expensive: retrying a refusal the
+// service had already acted on would execute — and bill — the same job twice.
+// The marker is what makes the retry safe to automate, because nothing behind
+// this handler has run for that request.
 func (e *epochConnections) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if epoch, stamped := r.Context().Value(acceptedEpoch{}).(int64); stamped && epoch != e.current.Load() {
@@ -81,6 +101,7 @@ func (e *epochConnections) guard(next http.Handler) http.Handler {
 			if r.ProtoMajor == 1 {
 				w.Header().Set("Connection", "close")
 			}
+			w.Header().Set(tee.EpochRetiredHeader, "1")
 			http.Error(w, "connection belongs to a retired attestation epoch; reconnect", http.StatusServiceUnavailable)
 			return
 		}

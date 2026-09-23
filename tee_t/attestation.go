@@ -81,11 +81,11 @@ func (t *TEET) refreshAttestation() error {
 	t.attestationMutex.Lock()
 	t.signingKeyPair = newKeyPair
 	t.cachedAttestation = attestationReport
-	// Expiry tracks the real NitroTPM leaf (AWS) so we stop serving / refresh
-	// before it expires, instead of a fixed guess; falls back to the cache TTL
-	// for GCP/CS. A cache miss regenerates, so this self-heals if AWS shortens
-	// the leaf.
-	t.attestationExpiry = shared.SNPAttestationExpiry(raw)
+	// Expiry tracks the real NitroTPM leaf (AWS), minus the shared signing
+	// margin, so the cached attestation is regenerated before it expires rather
+	// than at a fixed guess; falls back to the cache TTL for GCP/CS. A cache
+	// miss regenerates, so this self-heals if AWS shortens the leaf.
+	t.attestationExpiry, _ = shared.SNPSigningDeadline(raw)
 	t.attestationMutex.Unlock()
 	t.logger.Debug("Cached new attestation",
 		zap.String("type", attestationReport.Type),

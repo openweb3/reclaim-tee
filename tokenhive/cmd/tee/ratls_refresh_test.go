@@ -50,14 +50,23 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 		{
 			name:     "short-lived leaf drives the cadence instead of the ceiling",
 			notAfter: time.Now().Add(time.Hour),
-			want:     func(d time.Duration) bool { return d > 25*time.Minute && d < 30*time.Minute },
-			wantWhy:  "refresh 30 minutes before the leaf expires, not at the two-hour mark",
+			want:     func(d time.Duration) bool { return d > 50*time.Minute && d < 52*time.Minute },
+			wantWhy:  "rotate a rotation lead before the leaf expires, not at the two-hour mark and not at the signing deadline",
 		},
 		{
 			name:     "an already-expired leaf retries on the floor",
 			notAfter: time.Now().Add(-2 * time.Hour),
 			want:     func(d time.Duration) bool { return d == minRefreshFloor },
 			wantWhy:  "a negative delay must not become a spin loop",
+		},
+		{
+			name: "a leaf inside its signing margin retries on the floor",
+			// The lease is still valid — the listener keeps admitting handshakes
+			// for another three minutes — but receipts under it would carry too
+			// little validity, so the rotation is retried until it lands.
+			notAfter: time.Now().Add(3 * time.Minute),
+			want:     func(d time.Duration) bool { return d == minRefreshFloor },
+			wantWhy:  "the signing margin has passed and only a rotation clears it",
 		},
 	}
 	for _, test := range tests {
@@ -90,17 +99,102 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 	})
 }
 
-// TestAttestationExpiryReportsWhetherItTrackedTheLeaf pins the flag the
-// cadence logs on. An AWS evidence's deadline comes from its NitroTPM leaf and
-// is adaptive; anything else falls back to the fixed TTL, and the loop has to
-// be able to announce that instead of looking like a healthy schedule.
-func TestAttestationExpiryReportsWhetherItTrackedTheLeaf(t *testing.T) {
-	tracked := nitroAttestation(t, time.Now().Add(3*time.Hour))
-	if _, ok := rootShared.SNPAttestationExpiryFromLeaf(tracked); !ok {
-		t.Fatal("AWS evidence reported an untracked expiry")
+// TestRotationIsAimedInsideTheReissueWindow is the property the cadence exists
+// for, stated as relations between the three constants rather than as numbers,
+// and checked against a real snapshot's own leaf so the relations cannot drift
+// silently if any of the three is edited.
+//
+// Aiming at the signing deadline is what used to put a hole in every cycle: the
+// platform only reissues inside snpReissueWindow, so a rotation due at the
+// deadline cannot have landed before it, and the epoch still in service is past
+// the deadline by construction — new work refused, in-flight exchanges cut,
+// sessions ended, every 2h50m regardless of platform health. Aiming
+// snpRotationLead earlier makes the epoch that reaches the deadline the newer
+// one instead.
+func TestRotationIsAimedInsideTheReissueWindow(t *testing.T) {
+	// An hour, so the adaptive branch is what answers rather than the two-hour
+	// ceiling: a three-hour AWS leaf reaches the ceiling first and would hide the
+	// aim behind it.
+	notAfter := time.Now().Add(time.Hour)
+	refresher := &fakeRefresher{snapshot: fakeEpoch(nitroAttestation(t, notAfter))}
+	evidence := refresher.snapshot.Identity().Evidence
+
+	admission, ok := rootShared.SNPAdmissionDeadline(evidence)
+	if !ok {
+		t.Fatal("AWS evidence reported an untracked admission deadline")
 	}
-	if _, ok := rootShared.SNPAttestationExpiryFromLeaf([]byte("not-an-aws-envelope")); ok {
-		t.Fatal("non-AWS evidence reported a tracked expiry")
+	signing, ok := rootShared.SNPSigningDeadline(evidence)
+	if !ok {
+		t.Fatal("AWS evidence reported an untracked signing deadline")
+	}
+
+	// The lead has to be inside the window the platform will reissue in:
+	// outside it, the first attempt is handed back the leaf already in service.
+	if snpRotationLead >= snpReissueWindow {
+		t.Fatalf("rotation lead %s is not inside the %s reissue window; the first attempt would be handed back the leaf already in service",
+			snpRotationLead, snpReissueWindow)
+	}
+	// And the retry floor has to be shorter than the window, or a retry grid
+	// lands once before it and once after the leaf is already gone.
+	if minRefreshFloor >= snpReissueWindow {
+		t.Fatalf("retry floor %s is not shorter than the %s reissue window; the retry grid can step over all of it",
+			minRefreshFloor, snpReissueWindow)
+	}
+	// The rotation must be due before the signing deadline. This is the relation
+	// that stops the deadline from ever being reached by the live signer.
+	aim := admission.Add(-snpRotationLead)
+	if !aim.Before(signing) {
+		t.Fatalf("rotation aimed at %s, at or after the signing deadline %s: the deadline would be reached before a newer epoch exists",
+			aim, signing)
+	}
+	// With room for at least one retry between the aim and the deadline, a
+	// rotation that fails the first time still lands in time.
+	if attempts := int(signing.Sub(aim) / minRefreshFloor); attempts < 1 {
+		t.Fatalf("only %d retries fit between the aim %s and the deadline %s", attempts, aim, signing)
+	}
+
+	// The cadence returns the wait until that aim, not until the deadline.
+	got := nextRefreshDelay(context.Background(), refresher, true, rootShared.NewNopLogger())
+	want := time.Until(aim)
+	if diff := got - want; diff > time.Second || diff < -time.Second {
+		t.Fatalf("next rotation in %s, want %s (i.e. until %s): the cadence must aim at the reissue window rather than at the signing deadline",
+			got, want, aim)
+	}
+}
+
+// TestDeadlinesReportWhetherTheyTrackedTheLeaf pins both deadlines and the flag
+// the cadence logs on. They are deliberately different instants: admission runs
+// to the leaf's own NotAfter, the instant a verifier stops accepting it, while
+// signing stops a margin earlier so a receipt still has validity left when a
+// verifier reads it. An AWS evidence's deadlines come from its NitroTPM leaf;
+// anything else falls back to the fixed TTL, and the loop has to be able to
+// announce that instead of looking like a healthy schedule.
+func TestDeadlinesReportWhetherTheyTrackedTheLeaf(t *testing.T) {
+	notAfter := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	tracked := nitroAttestation(t, notAfter)
+
+	admission, ok := rootShared.SNPAdmissionDeadline(tracked)
+	if !ok {
+		t.Fatal("AWS evidence reported an untracked admission deadline")
+	}
+	if !admission.Equal(notAfter) {
+		t.Fatalf("admission deadline = %s, want the leaf's own NotAfter %s", admission, notAfter)
+	}
+	signing, ok := rootShared.SNPSigningDeadline(tracked)
+	if !ok {
+		t.Fatal("AWS evidence reported an untracked signing deadline")
+	}
+	if want := admission.Add(-rootShared.SNPSigningMargin); !signing.Equal(want) {
+		t.Fatalf("signing deadline = %s, want %s", signing, want)
+	}
+
+	for _, untracked := range [][]byte{[]byte("not-an-aws-envelope")} {
+		if _, ok := rootShared.SNPAdmissionDeadline(untracked); ok {
+			t.Fatal("non-AWS evidence reported a tracked admission deadline")
+		}
+		if _, ok := rootShared.SNPSigningDeadline(untracked); ok {
+			t.Fatal("non-AWS evidence reported a tracked signing deadline")
+		}
 	}
 }
 
@@ -150,6 +244,70 @@ func TestPublishEpochAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 	// The RA-TLS leaf is deliberately not published: a rotating epoch
 	// presents a new leaf every rotation, which no pin can name. The Hub
 	// verifies the evidence inside the leaf instead (see publish).
+}
+
+// TestPublishEpochIsANoOpForTheEpochAlreadyInService: the platform may have
+// nothing newer to give. AWS reissues its NitroTPM leaf only in the last minutes
+// of the leaf's life, so a tick that lands earlier asks, is handed back the
+// certificate already in service, and has nothing to publish. Such a tick must
+// leave the deployment exactly as it is: no rewritten identity, no rebuilt
+// service, and above all no retirement of the connections that are serving
+// traffic under an epoch that did not change.
+func TestPublishEpochIsANoOpForTheEpochAlreadyInService(t *testing.T) {
+	simDir := t.TempDir()
+	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
+
+	startup := fakeEpoch([]byte("startup-evidence"))
+	runtime := newTestRuntime(t, startup, false)
+	service := runtime.get()
+	epochs := runtime.conns.current.Load()
+
+	// A rotation the adapter declined: it regenerated the key and was handed back
+	// the leaf it already serves, so the epoch reaching this half is unchanged.
+	if err := publishOnce(&fakeRefresher{snapshot: startup}, runtime); err != nil {
+		t.Fatalf("publish the epoch already in service: %v", err)
+	}
+
+	if runtime.get() != service {
+		t.Fatal("a tick that found no newer epoch rebuilt the service that signs receipts")
+	}
+	if got := runtime.conns.current.Load(); got != epochs {
+		t.Fatal("a tick that found no newer epoch retired the connections serving under it")
+	}
+	if got := readPersistedIdentity(t, simDir); got.KeyID != startup.Identity().KeyID {
+		t.Fatal("a tick that found no newer epoch rewrote the published identity")
+	}
+}
+
+// TestPublishEpochRetriesAPublicationThatDidNotLand is the other side of that
+// guard: skipping an epoch the runtime already serves must not skip one that
+// failed to land. The adapter swaps its epoch before this half runs, so a
+// publication that fails leaves the listener serving a key the signer does not
+// use — a state only a retry can correct, and the retry has to survive the
+// comparison that makes the no-op tick free.
+func TestPublishEpochRetriesAPublicationThatDidNotLand(t *testing.T) {
+	t.Setenv("TOKENHIVE_SIM_DIR", t.TempDir())
+
+	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")), false)
+
+	// Evidence that does not hash to its own identity: the store refuses it, so
+	// this is the rotation that reaches the runtime and cannot be published.
+	unpublishable := fakeEpoch([]byte("startup-evidence"))
+	unpublishable.id.Evidence = []byte("rotated-evidence")
+	if err := publishOnce(&fakeRefresher{snapshot: unpublishable}, runtime); err == nil {
+		t.Fatal("published an epoch whose evidence could not be written")
+	}
+	if runtime.serving(unpublishable.Identity().KeyID) {
+		t.Fatal("a publication that failed left its epoch recorded as in service")
+	}
+
+	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
+	if err := publishOnce(&fakeRefresher{snapshot: rotated}, runtime); err != nil {
+		t.Fatalf("publish after a failed publication: %v", err)
+	}
+	if !runtime.serving(rotated.Identity().KeyID) {
+		t.Fatal("the retry did not install the epoch the adapter serves")
+	}
 }
 
 // TestPublishEpochSkipsTheStoreForInlineReceipts: an inline receipt carries its

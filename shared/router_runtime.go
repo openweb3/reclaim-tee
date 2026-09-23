@@ -46,15 +46,25 @@ const RATLSRefreshInterval = 4 * time.Minute
 
 // SEV-SNP attestations are bounded by cert validity (AWS NitroTPM leaf), not a
 // short TTL, and regenerating them is CPU-heavy. This is now a CEILING: the
-// actual cadence is driven by the real leaf NotAfter (SNPAttestationExpiry),
-// refreshing SNPRefreshMargin before it expires. The ceiling caps churn when
-// the leaf is long-lived; a shorter-than-expected leaf refreshes faster.
+// actual cadence is driven by the real leaf NotAfter, rotating when that
+// evidence's signing deadline comes due. The ceiling caps churn when the leaf is
+// long-lived; a shorter-than-expected leaf rotates sooner.
 const RATLSRefreshIntervalSNP = 2 * time.Hour
 
-// SNPRefreshMargin is how long before the NitroTPM leaf's NotAfter a TEE stops
-// serving / regenerates its attestation, so a verifier (peer or attestor) never
-// sees a leaf within this window of expiry.
-const SNPRefreshMargin = 30 * time.Minute
+// SNPSigningMargin is how long before the NitroTPM leaf's NotAfter a TEE stops
+// signing receipts under that leaf's evidence: a receipt issued now still has
+// this much validity left, so a verifier checking evidence against its own clock
+// is not handed a leaf that expires while the receipt is in flight.
+//
+// It bounds signing, NOT admission. A verifier accepts the leaf until its
+// NotAfter and no later, so a TEE that stops presenting the leaf any earlier
+// refuses handshakes that would have verified — and since AWS reissues the leaf
+// only in the last minutes of its life, a rotation that lands earlier is simply
+// handed back the certificate it already holds. A margin wider than that reissue
+// window is therefore not a safety net; it is an interval in which every
+// handshake is refused and no rotation can succeed. Admission runs to the leaf's
+// own NotAfter (SNPAdmissionDeadline), and this margin stays well inside it.
+const SNPSigningMargin = 5 * time.Minute
 
 // ratlsRefreshInterval picks the cert-refresh cadence for the active TEE mode.
 func ratlsRefreshInterval() time.Duration {
@@ -76,25 +86,37 @@ func AttestationCacheTTL() time.Duration {
 	return 5 * time.Minute
 }
 
-// SNPAttestationExpiry returns when a just-generated attestation should be
-// considered stale. For AWS it's the real NitroTPM leaf NotAfter minus
-// SNPRefreshMargin — so the cadence tracks AWS's actual leaf TTL instead of a
-// hardcoded guess. For GCP/CS (no short-lived NitroTPM leaf) it falls back to
-// now + AttestationCacheTTL().
-func SNPAttestationExpiry(attestation []byte) time.Time {
-	deadline, _ := SNPAttestationExpiryFromLeaf(attestation)
-	return deadline
+// SNPAdmissionDeadline returns when a TEE must stop presenting this attestation:
+// the NitroTPM leaf's own NotAfter.
+//
+// That is the exact instant a verifier stops accepting the leaf — the Hub's
+// chain check and a receipt verifier's both compare it against their own clock
+// and nothing else — so a TEE that stops earlier is not being conservative, it
+// is refusing handshakes that would have verified. The flag reports whether the
+// deadline came from the attestation's own leaf (AWS) rather than the fallback
+// below, which is how a caller tells a real expiry from the guess it silently
+// degrades to.
+func SNPAdmissionDeadline(attestation []byte) (time.Time, bool) {
+	return snpLeafDeadline(attestation, 0)
 }
 
-// SNPAttestationExpiryFromLeaf is SNPAttestationExpiry plus whether the deadline
-// came from the attestation's own NitroTPM leaf (AWS) rather than the fixed
-// cache-TTL fallback. A caller that schedules on the deadline uses the flag to
-// tell the adaptive cadence apart from the guess it silently degrades to — the
-// state that looks like a healthy two-hour schedule right up to the point the
-// three-hour leaf expires under it.
-func SNPAttestationExpiryFromLeaf(attestation []byte) (time.Time, bool) {
+// SNPSigningDeadline returns when a TEE must stop signing receipts under this
+// attestation: SNPSigningMargin before the leaf's NotAfter. A rotation schedule
+// aims at that instant, because it is the last moment a receipt can be issued
+// under this evidence: one issued later would cite evidence that expires inside
+// the margin its verifier requires.
+func SNPSigningDeadline(attestation []byte) (time.Time, bool) {
+	return snpLeafDeadline(attestation, SNPSigningMargin)
+}
+
+// snpLeafDeadline reads the NitroTPM leaf's NotAfter out of an AWS combined
+// attestation and steps back by margin. Evidence with no readable leaf (GCP
+// Confidential Space, the simulation) has no TEE-side expiry to read: callers
+// get now + AttestationCacheTTL() — enough to schedule a rotation, and never a
+// verdict on serving, which is what tracked=false tells them.
+func snpLeafDeadline(attestation []byte, margin time.Duration) (time.Time, bool) {
 	if notAfter, ok := SNPNitroLeafNotAfter(attestation); ok {
-		return notAfter.Add(-SNPRefreshMargin), true
+		return notAfter.Add(-margin), true
 	}
 	return time.Now().Add(AttestationCacheTTL()), false
 }
@@ -197,8 +219,9 @@ type RATLSRefresher interface {
 // still references the old hash). Pass nil if not needed.
 // nextInterval, when non-nil, is consulted after each refresh to pick the delay
 // until the next one — letting SEV-SNP track the actual NitroTPM leaf expiry
-// (refresh SNPRefreshMargin before NotAfter) instead of a fixed cadence. A nil
-// callback (or a non-positive return) falls back to the fixed ratlsRefreshInterval().
+// (rotate when the evidence's signing deadline comes due, SNPSigningDeadline)
+// instead of a fixed cadence. A nil callback (or a non-positive return) falls
+// back to the fixed ratlsRefreshInterval().
 //
 // skipInitial suppresses the one priming call postRefresh otherwise gets before
 // the loop starts. Callers whose postRefresh populates state that a reader

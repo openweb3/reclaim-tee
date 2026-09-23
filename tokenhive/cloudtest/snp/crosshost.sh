@@ -22,6 +22,12 @@
 #               Add --host-ip <hub-ip> when the Hub lives on a separate machine:
 #               it becomes the tee's TEE_RELAY target (the address as the tee
 #               sees the Hub, i.e. the private IP when both share this VPC/SG).
+#   ./crosshost.sh up --new     launch a FRESH confidential tee even when a live
+#               one is recorded, and leave the recorded one RUNNING: its record
+#               moves to `superseded` instead of being overwritten. This is the
+#               no-wait swap — start the new tee, repoint the Hub at it, then
+#               retire the old one with `down --superseded`. Nothing is
+#               terminated by `up` on any path.
 #   ./crosshost.sh fetch     ssh to host: pull the tee's current RA-TLS leaf over
 #                            the mTLS port (with the Hub client identity), for
 #                            inspection only — the Hub verifies the evidence in
@@ -32,6 +38,9 @@
 #   ./crosshost.sh down      terminate BOTH instances strictly by tag
 #   ./crosshost.sh down --tee-only  terminate ONLY the recorded confidential tee,
 #               leaving a separately-provisioned Hub host untouched
+#   ./crosshost.sh down --superseded  terminate ONLY the instances `up`
+#               recorded as superseded, and only after checking the current tee
+#               is recorded and running. Never enumerates by tag.
 #   ./crosshost.sh down --dry-run   list what would be terminated, delete nothing
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # cloudtest/snp
@@ -93,7 +102,7 @@ for r in ec2.describe_instances(Filters=[
 ])["Reservations"]:
     for i in r["Instances"]:
         if i.get("PublicIpAddress") == sys.argv[1]:
-            print(ec2.get_console_output(InstanceId=i["InstanceId"]).get("Output",""))
+            print(ec2.get_console_output(InstanceId=i["InstanceId"], Latest=True).get("Output",""))
             break
 PY
 }
@@ -243,12 +252,13 @@ cmd_build_single() {
 
 cmd_up() {
   [ -f "${CERTS_DIR}/hub-ca.pem" ] || { echo "run ./crosshost.sh build first (certs)"; exit 1; }
-  local a mode="" name="snp-tokenhive" digest host_ip="" host_arg=""
+  local a mode="" new_arg="" name="snp-tokenhive" digest host_ip="" host_arg=""
   shift || true                       # drop the "up" verb
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --single)   mode="--single";   name="snp-tokenhive-single" ;;
       --tee-only) mode="--tee-only" ;;
+      --new)      new_arg="--new" ;;
       --host-ip)  shift; host_ip="${1:-}" ;;
       *) echo "up: unknown option $1" >&2; exit 2 ;;
     esac
@@ -284,7 +294,7 @@ cmd_up() {
   # an unlabelled image can never be pinned, and discovering that afterwards
   # would have bought a confidential instance for a run that cannot finish.
   digest="snp-app:$(ami_app_digest "${a}")"
-  ( cd "${HERE}" && "${PY}" crosshost.py "${a}" ${mode} ${host_arg} ) | tee -a "${LOG_DIR}/run.log"
+  ( cd "${HERE}" && "${PY}" crosshost.py "${a}" ${mode} ${new_arg} ${host_arg} ) | tee -a "${LOG_DIR}/run.log"
   # Record it only now that the instance exists: crosshost.py owns the state
   # file (it creates the tee record merged into below), and an identity recorded
   # for an instance that never came up would pin the next deploy to an app that
@@ -449,7 +459,7 @@ EOF
   dump_tee_console "$(tee_field public_ip)"
 }
 
-# cmd_down [--dry-run] [--tee-only]
+# cmd_down [--dry-run] [--tee-only] [--superseded]
 # A plain down deletes EVERY instance carrying the cloudtest tag pair. That is
 # right for a coupled run: both instances were launched for this state, and
 # matching purely by tag is what keeps teardown working after crosshost.json is
@@ -459,15 +469,28 @@ EOF
 # --tee-only narrows teardown to the tee recorded in crosshost.json. The record
 # is never trusted on its own: the instance is re-checked for both tags before
 # it is terminated, so a stale or hand-edited entry cannot widen the match.
+# --superseded narrows it further still: only the instances an `up`
+# recorded as superseded (retire.py), which is how a swap disposes of the old
+# tee after the Hub has been repointed at the new one.
 cmd_down() {
-  local dry_run="" tee_only="" arg iid
+  local dry_run="" tee_only="" superseded="" arg iid
   for arg in "$@"; do
     case "${arg}" in
-      --dry-run)  dry_run="--dry-run" ;;
-      --tee-only) tee_only="1" ;;
+      --dry-run)    dry_run="--dry-run" ;;
+      --tee-only)   tee_only="1" ;;
+      --superseded) superseded="1" ;;
       *) echo "down: unknown option ${arg}" >&2; exit 2 ;;
     esac
   done
+  if [[ -n "${tee_only}" && -n "${superseded}" ]]; then
+    echo "down: --tee-only and --superseded are mutually exclusive" >&2
+    exit 2
+  fi
+  if [[ -n "${superseded}" ]]; then
+    log "step: down --superseded (terminate only the instances recorded by 'up')"
+    ( cd "${HERE}" && "${PY}" retire.py --state "${HOSTS}" ${dry_run} ) | tee -a "${LOG_DIR}/run.log"
+    return
+  fi
   if [[ -z "${tee_only}" ]]; then
     log "step: down (strict tag deletion of all matching instances)"
     ( cd "${CLOUDTEST}" && "${PY}" delete.py ${dry_run} ) | tee -a "${LOG_DIR}/run.log"

@@ -4,9 +4,12 @@ package shared
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -16,6 +19,13 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// isAlreadyExists reports the one creation failure that is not a problem: a log
+// group or stream this deployment (or a previous boot of it) already made.
+func isAlreadyExists(err error) bool {
+	var exists *cwtypes.ResourceAlreadyExistsException
+	return errors.As(err, &exists)
+}
+
 // cwShipper owns the CloudWatch client + log group/stream + an async batching
 // queue, shared across With()-derived cores.
 type cwShipper struct {
@@ -23,6 +33,35 @@ type cwShipper struct {
 	group  string
 	stream string
 	ch     chan cwtypes.InputLogEvent
+
+	// The counters exist because nothing else about a broken sink is observable:
+	// the app must never block on its logger, so a failed ship is a drop, and the
+	// only channel that does not depend on the sink working is stderr.
+	mu            sync.Mutex
+	failedShips   uint64
+	droppedEvents uint64
+	lastComplain  time.Time
+}
+
+// complain reports a broken sink on stderr, at most once a minute. Console
+// output is what survives a sink that cannot ship, so a TEE whose logs are being
+// discarded says so on the serial console rather than looking silent and healthy
+// — the state that hid this deployment's attestation failures until the TEE went
+// dark for other reasons.
+func (s *cwShipper) complain(msg string) {
+	s.mu.Lock()
+	s.failedShips++
+	failed, dropped := s.failedShips, s.droppedEvents
+	quiet := time.Since(s.lastComplain) < time.Minute
+	if !quiet {
+		s.lastComplain = time.Now()
+	}
+	s.mu.Unlock()
+	if quiet {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "logger: cloudwatch sink is losing logs after %d failed ships and %d dropped events: %s\n",
+		failed, dropped, msg)
 }
 
 func (s *cwShipper) run() {
@@ -35,11 +74,15 @@ func (s *cwShipper) run() {
 		}
 		// PutLogEvents requires chronological order.
 		sort.Slice(batch, func(i, j int) bool { return *batch[i].Timestamp < *batch[j].Timestamp })
-		_, _ = s.client.PutLogEvents(context.Background(), &cloudwatchlogs.PutLogEventsInput{
+		if _, err := s.client.PutLogEvents(context.Background(), &cloudwatchlogs.PutLogEventsInput{
 			LogGroupName:  &s.group,
 			LogStreamName: &s.stream,
 			LogEvents:     batch,
-		})
+		}); err != nil {
+			// Deliberately not `_, _ =`: a sink that cannot ship is the difference
+			// between an operable TEE and a silent one.
+			s.complain("PutLogEvents: " + err.Error())
+		}
 		batch = batch[:0]
 	}
 	for {
@@ -82,10 +125,31 @@ func newCloudWatchCore(serviceName string, level zapcore.Level) (zapcore.Core, e
 		stream += "-" + h
 	}
 
-	ctx := context.Background()
-	// Idempotent setup; ignore "already exists".
-	_, _ = client.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{LogGroupName: &group})
-	_, _ = client.CreateLogStream(ctx, &cloudwatchlogs.CreateLogStreamInput{LogGroupName: &group, LogStreamName: &stream})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Idempotent setup. Only "already exists" is survivable here: every other
+	// failure means this process cannot ship its logs at all, and the caller has
+	// to fall back to the console rather than accept a sink that discards
+	// everything in silence.
+	if _, err := client.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{LogGroupName: &group}); err != nil && !isAlreadyExists(err) {
+		return nil, fmt.Errorf("create log group %s: %w", group, err)
+	}
+	if _, err := client.CreateLogStream(ctx, &cloudwatchlogs.CreateLogStreamInput{LogGroupName: &group, LogStreamName: &stream}); err != nil && !isAlreadyExists(err) {
+		return nil, fmt.Errorf("create log stream %s/%s: %w", group, stream, err)
+	}
+	// Prove the sink accepts events before the process trusts it. Creating the
+	// group and stream proves nothing: an instance with no IAM instance profile
+	// (or a role without logs:PutLogEvents) builds this client happily and then
+	// fails every ship — which is how a TEE ran with its rotation failures
+	// recorded nowhere while its console held only handshake noise.
+	probe := "logger: cloudwatch sink online"
+	if _, err := client.PutLogEvents(ctx, &cloudwatchlogs.PutLogEventsInput{
+		LogGroupName:  &group,
+		LogStreamName: &stream,
+		LogEvents:     []cwtypes.InputLogEvent{{Message: &probe, Timestamp: aws.Int64(time.Now().UnixMilli())}},
+	}); err != nil {
+		return nil, fmt.Errorf("cloudwatch sink %s/%s cannot ship events: %w", group, stream, err)
+	}
 
 	encCfg := zapcore.EncoderConfig{
 		TimeKey:        "timestamp",
@@ -131,6 +195,10 @@ func (c *cloudWatchCore) Write(entry zapcore.Entry, fields []zapcore.Field) erro
 	select {
 	case c.sh.ch <- ev:
 	default: // queue full — drop rather than block the app
+		c.sh.mu.Lock()
+		c.sh.droppedEvents++
+		c.sh.mu.Unlock()
+		c.sh.complain("queue full, event dropped")
 	}
 	return nil
 }

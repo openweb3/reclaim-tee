@@ -321,6 +321,11 @@ func main() {
 			TLSConfig:   leafTLS,
 			ConnContext: svcRuntime.conns.accept,
 			ConnState:   svcRuntime.conns.track,
+			// A fail-closed listener sees one rejected handshake per retry from a
+			// Hub that keeps asking, which is enough to fill the serial console —
+			// the only diagnostics an enclave without sshd has — within minutes.
+			// See listenerlog.go.
+			ErrorLog: log.New(newListenerLog(os.Stderr), "", log.LstdFlags),
 		}
 		log.Fatal(server.ListenAndServeTLS("", ""))
 	}
@@ -338,6 +343,9 @@ func main() {
 		// describe. The execute body itself is bounded inside ServeExecute.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		// Same reason as the mTLS listener above: the console is the last channel
+		// to survive a broken log sink, so nothing may consume it in bulk.
+		ErrorLog: log.New(newListenerLog(os.Stderr), "", log.LstdFlags),
 	}
 	log.Fatal(srv.ListenAndServe())
 }

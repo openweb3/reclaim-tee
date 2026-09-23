@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -101,11 +102,48 @@ func NewHTTPFetcher(base string, client *http.Client) (*HTTPFetcher, error) {
 // Fetch resolves id.EvidenceHash against the peer's /v1/evidence endpoint. The
 // caller must still validate the returned bytes through a platform verifier;
 // this only guarantees the bytes hash to the value the receipt names.
+//
+// One 503 is retried, once, on a connection the client's pool cannot supply.
+// /v1/evidence is served on the same listener as /v1/execute, so a rotation
+// retires connections underneath it too — and this fetch sits on the
+// settlement path, once per hash-only receipt, which makes a refusal here a
+// verified job thrown away after the provider already ran. Unlike execute's
+// refusal this one needs no marker to be retryable: the bytes are a read,
+// keyed by their own hash and checked against it below, so there is no
+// sequence number, credential or provider exchange a second attempt could
+// repeat. A peer that is genuinely unavailable fails both attempts; the retry
+// costs one round-trip.
 func (f *HTTPFetcher) Fetch(ctx context.Context, id platform.Identity) ([]byte, error) {
+	raw, err := f.fetch(ctx, id, false)
+	if !errors.Is(err, errRefused) {
+		return raw, err
+	}
+	return f.fetch(ctx, id, true)
+}
+
+// errRefused marks the one HTTP answer Fetch retries, so the decision cannot be
+// lost inside a wrap.
+var errRefused = errors.New("evidence: peer refused the fetch")
+
+// fetch performs one retrieval. freshConnection asks for a connection the pool
+// has not handed over, which is what the retry above needs: every pooled
+// connection to a rotating TEE is one a rotation may have retired, and the pool
+// does not learn that until it tries to use them.
+//
+// That takes more than req.Close, which on HTTP/1 only decides whether the
+// connection may be kept once the response is back — the pool is consulted on
+// the way in without looking at it — so the pool is evicted as well. Eviction
+// is what makes the retry dial, and so complete a handshake that postdates the
+// rotation, on either protocol.
+func (f *HTTPFetcher) fetch(ctx context.Context, id platform.Identity, freshConnection bool) ([]byte, error) {
 	url := f.baseURL + "/v1/evidence/" + hex.EncodeToString(id.EvidenceHash[:])
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
+	}
+	req.Close = freshConnection
+	if freshConnection {
+		f.client.CloseIdleConnections()
 	}
 	resp, err := f.client.Do(req)
 	if err != nil {
@@ -114,6 +152,9 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, id platform.Identity) ([]byte, 
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, ErrNoEvidence
+	}
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return nil, fmt.Errorf("%w: fetch %s: status %d", errRefused, url, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("evidence: fetch %s: status %d", url, resp.StatusCode)

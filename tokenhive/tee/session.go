@@ -16,7 +16,11 @@
 //  3. 收尾段 — when either side closes, the TEE signs a session receipt
 //     (StatusCode 101, RequestBytes = uplink total, ResponseBytes/ChunkCount/
 //     StreamHash = downlink) and sends it as a final Text message before
-//     closing the WebSocket.
+//     closing the WebSocket. A session ends this way on its own terms only for
+//     as long as the epoch its receipt must cite has room to sign one: the same
+//     deadline an exchange is bounded by ends a session too, because a session
+//     cannot be bounded in advance and an unattestable session settles nothing
+//     (see Service.watchSigningDeadline).
 //
 // Two message orientations keep the two roles apart: tunnel bytes are always
 // Binary, session control (ack, receipt) is always Text.
@@ -137,6 +141,12 @@ func ServeSession(svc *Service, w http.ResponseWriter, r *http.Request) {
 // moves uplink bytes, so there is a single writer to the WebSocket and the TEE
 // does no framing work of its own — the receipt therefore always reaches the
 // Hub as the terminal marker, exactly as the 收尾段 of §5.2 promises.
+//
+// The pump owns every other ending too. Two watchers can end a session short of
+// the provider's own end of stream — one for a peer that stopped moving bytes,
+// one for an epoch that ran out of room to sign — and neither writes a receipt
+// of its own: the pump is still the only thing that signs and sends one, so it
+// keeps its single writer and the receipt still arrives as the terminal marker.
 func relaySession(conn *websocket.Conn, ss *Session) {
 	// An idle watchdog bounds the session so a peer that stops moving bytes
 	// cannot wedge it forever. It is reset by every successful relay in either
@@ -145,13 +155,13 @@ func relaySession(conn *websocket.Conn, ss *Session) {
 	// closes the conn on its own, which stops the watchdog in time.
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
-	stopWatchdog := make(chan struct{})
+	stop := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stopWatchdog:
+			case <-stop:
 				return
 			case <-ticker.C:
 				last := time.Unix(0, lastActivity.Load())
@@ -163,7 +173,28 @@ func relaySession(conn *websocket.Conn, ss *Session) {
 		}
 	}()
 	touch := func() { lastActivity.Store(time.Now().UnixNano()) }
-	defer close(stopWatchdog)
+	defer close(stop)
+
+	// The signing-deadline watcher is the other ending the provider does not
+	// choose, and unlike the idle one it must not close the Websocket: the
+	// receipt is what this session is worth, and it is signed and sent by the
+	// pump only once the tunnel it reads from is gone. So it ends the provider
+	// side and lets the pump finish the job — see Service.watchSigningDeadline
+	// for why a session cannot simply be allowed to run past the deadline it
+	// must be signed under.
+	cutoff := ss.svc.watchSigningDeadline(stop)
+	go func() {
+		select {
+		case <-stop:
+		case <-cutoff:
+			// The mark comes first, and not as a convenience: the close below
+			// is what unblocks the pump, and a provider whose connection ends
+			// on a clean read would otherwise leave the receipt claiming a
+			// transcript that is missing everything after this instant.
+			ss.markTruncated()
+			_ = ss.Close()
+		}
+	}()
 
 	pumpDone := make(chan struct{})
 	go func() {

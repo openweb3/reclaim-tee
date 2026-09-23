@@ -95,7 +95,9 @@ python3 -m unittest discover -s tests -v
 
 覆盖：ensure 幂等、SEV-SNP 启动参数与双标签、按 tag 精确删除、delete 不依赖
 hosts.json、delete_infra 只拆自己带双标签的资源（别人的/缺标签的/无标签的必须
-存活）、`TOKENHIVE_USER` 缺失时直接失败。全部使用内存 fake EC2，不需要 boto3，
+存活）、`TOKENHIVE_USER` 缺失时直接失败，以及换 TEE 的换机路径（`up --new` 只记录
+不删除、`shutting-down` 的旧记录绝不被复用、`retire.py` 只删 `superseded` 里记过的
+实例且要求接替者处于 `running`）。全部使用内存 fake EC2，不需要 boto3，
 也绝不会触达真实云。
 
 ## 真实运行前置条件

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // fakeConn is a net.Conn that records only what this bookkeeping does to it.
@@ -101,6 +103,11 @@ func TestGuardRefusesRequestsFromARetiredEpoch(t *testing.T) {
 	}
 	if got.Header().Get("Connection") != "close" {
 		t.Fatal("an HTTP/1.1 peer was not told to drop the retired connection")
+	}
+	// The marker is what lets the Hub retry this refusal automatically instead
+	// of guessing whether the request was already executed.
+	if got.Header().Get(tee.EpochRetiredHeader) != "1" {
+		t.Fatal("a retired-epoch refusal was not marked, so a peer cannot tell it from any other 503")
 	}
 }
 

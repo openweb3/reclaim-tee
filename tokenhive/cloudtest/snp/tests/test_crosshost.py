@@ -172,5 +172,40 @@ class ArchivedBundleTest(unittest.TestCase):
             self.assertEqual(out.stdout.strip(), "")
 
 
+class SwapWiringTest(unittest.TestCase):
+    """`up --new` / `down --superseded`: the shell half of the no-wait swap.
+
+    The swap's safety lives in crosshost.py and retire.py, but the operator
+    reaches both through these two shells — and a flag that is accepted and then
+    dropped is silent: `up --new` without --new quietly becomes "adopt whatever
+    is recorded", which is the very thing the swap was written to avoid.
+    """
+
+    def test_up_parses_and_forwards_new(self):
+        body = _shell_function("cmd_up")
+        self.assertIn('new_arg="--new"', body)
+        self.assertIn("${new_arg}", body,
+                      "--new must reach crosshost.py, not just be accepted here")
+
+    def test_down_superseded_delegates_to_retire_py(self):
+        body = _shell_function("cmd_down")
+        self.assertIn("retire.py", body)
+        self.assertIn('--state "${HOSTS}"', body)
+        # Its only narrowing is the recorded superseded set; the tag-wide
+        # delete.py must not be reachable on that path.
+        self.assertNotIn("delete.py", body[body.index("--superseded"):body.index("if [[ -z \"${tee_only}\"")])
+
+    def test_down_keeps_the_two_narrowings_apart(self):
+        body = _shell_function("cmd_down")
+        self.assertIn("mutually exclusive", body)
+
+    def test_console_dump_asks_for_the_latest_output(self):
+        # Without Latest=True get_console_output returns a stale buffer, so a TEE
+        # that came up after boot looks like one that never logged again — the
+        # check a swap leans on to decide the new enclave is serving.
+        body = _shell_function("dump_tee_console")
+        self.assertIn("Latest=True", body)
+
+
 if __name__ == "__main__":
     unittest.main()

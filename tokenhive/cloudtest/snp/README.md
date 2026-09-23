@@ -81,6 +81,34 @@ aws iam put-role-policy --role-name vmimport --policy-name vmimport \
     {"Effect":"Allow","Action":["ec2:ImportSnapshot"],"Resource":"*"}]}'
 ```
 
+The identity running `crosshost.py` also needs `iam:PassRole` on whichever
+instance profile it hands the confidential instance (see below).
+
+## Where the TEE's logs go
+
+On AWS the TEE's structured logger ships to CloudWatch Logs **through the
+instance's IAM role**, so a confidential instance launched with no instance
+profile keeps running but cannot ship a log: the console is its only channel and
+holds a few minutes. `crosshost.py` attaches one when
+`TOKENHIVE_TEE_INSTANCE_PROFILE` names it, and records the result in
+`crosshost.json` as `tee.instance_profile`:
+
+```bash
+# once, as an admin: a role that may only write this deployment's logs
+aws iam create-role --role-name tokenhive-tee-logs \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam put-role-policy --role-name tokenhive-tee-logs --policy-name ship-logs \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:*:*:log-group:/reclaim-tee/snp:*"}]}'
+aws iam create-instance-profile --instance-profile-name tokenhive-tee-logs
+aws iam add-role-to-instance-profile --instance-profile-name tokenhive-tee-logs --role-name tokenhive-tee-logs
+
+TOKENHIVE_TEE_INSTANCE_PROFILE=tokenhive-tee-logs ./crosshost.sh up --tee-only --host-ip <hub-ip>
+```
+
+The profile is bound at `RunInstances` and cannot be added to a running
+instance, so a reused TEE keeps whatever it launched with — `up` prints the
+difference rather than letting a just-configured profile quietly not apply.
+
 Local tool check (no S3/VM import needed for this): `installed() { command -v %s >/dev/null; }, docker qemu-img aws`.
 
 ## Layout
@@ -90,4 +118,5 @@ Local tool check (no S3/VM import needed for this): `installed() { command -v %s
 - `launch.py` — idempotent infra + launch the confidential instance; writes `hosts.json`.
 - `snp.sh` — orchestrator (`build|up|status|verify|down|delete-infra`, `--dry-run`).
 - `iam/aws-snp-policy.json` — the precise EC2/S3/VM-import permissions.
-- `tests/` — local unit tests (no AWS): bundle determinism, tar layout, tag-deletion safety.
+- `tests/` — local unit tests (no AWS): bundle determinism, tar layout, tag-deletion safety,
+  and the swap wiring (`up --new` forwards the flag; `down --superseded` goes through `retire.py`).
