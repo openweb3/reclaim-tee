@@ -59,6 +59,12 @@ const (
 // and /dev/tpm0, and already reboots the guest on a wedged channel), whereas
 // the TEE app itself is unprivileged and cannot set the clock at all.
 //
+// The first exchange is synchronous: the broker must not answer its first
+// attestation request while the clock is still uncorrected, or the app's
+// initial NitroTPM certificate can be verified against a behind clock and kill
+// the app. Only the periodic resyncs run, in the background, for the life of
+// the process.
+//
 // Safe to call on a guest whose clock is already correct — that is the normal
 // case — and safe to call when no time source is reachable, in which case it
 // leaves the clock alone rather than guessing. A nil logger is tolerated so a
@@ -73,9 +79,11 @@ func DeployClockDiscipline(logger *Logger) {
 		}
 	}
 	resync("initial clock sync")
-	for range time.Tick(clockResyncInterval) {
-		resync("clock resync")
-	}
+	go func() {
+		for range time.Tick(clockResyncInterval) {
+			resync("clock resync")
+		}
+	}()
 }
 
 // syncClockOnce performs one SNTP exchange and applies the resulting step.
@@ -141,8 +149,19 @@ func querySNTP(server string, timeout time.Duration) (time.Duration, error) {
 	if mode := resp[0] & 0x7; mode != 4 {
 		return 0, fmt.Errorf("sntp: reply mode %d is not server", mode)
 	}
+	// LI 3 and stratum > 15 both mean the server itself has no synchronized
+	// reference, so its timestamps are placeholders. Stepping the clock on
+	// their word could push this guest behind the NitroTPM NotBefore — the
+	// very failure this discipline exists to prevent — so refuse the reply
+	// and let the next tick try again.
+	if li := resp[0] >> 6; li == 3 {
+		return 0, fmt.Errorf("sntp: server reports an unsynchronized clock (LI 3)")
+	}
 	if resp[1] == 0 {
 		return 0, fmt.Errorf("sntp: server reports Kiss-o'-Death")
+	}
+	if resp[1] > 15 {
+		return 0, fmt.Errorf("sntp: reply stratum %d is not a synchronized source", resp[1])
 	}
 	// The server echoes our transmit stamp in the origin field. A reply whose
 	// origin does not match is a stale or forged packet off the wire, not our
@@ -166,14 +185,27 @@ func sntpOffset(t1, t2, t3, t4 time.Time) time.Duration {
 }
 
 // ntpTimestamp decodes a 64-bit NTP timestamp: 32-bit seconds since 1900 in the
-// high half, a 2^-32-second fraction in the low half.
+// high half, a 2^-32-second fraction in the low half. The seconds field wraps
+// in 2036, so the decoded instant is shifted into the era the local clock
+// currently lives in — otherwise a post-rollover reply reads as a date near
+// 1900, the offset exceeds maxClockStep, and the clock never gets corrected
+// again. The two candidates are 136 years apart, so at most one shift is ever
+// needed.
 func ntpTimestamp(b []byte) time.Time {
 	sec := binary.BigEndian.Uint32(b[0:4])
 	frac := binary.BigEndian.Uint32(b[4:8])
 	// Integer arithmetic throughout: the fraction is a 32-bit binary point, and
 	// float64 cannot hold a day-scale unix time with the precision this needs.
 	nsec := int64(frac) * 1e9 / (1 << 32)
-	return time.Unix(int64(sec)-ntpEpochOffset, nsec)
+	unix := int64(sec) - ntpEpochOffset
+	now := time.Now().Unix()
+	for now-unix > 1<<31 {
+		unix += 1 << 32
+	}
+	for unix-now > 1<<31 {
+		unix -= 1 << 32
+	}
+	return time.Unix(unix, nsec)
 }
 
 // putNTPTimestamp encodes t into the 64-bit NTP layout used by both the

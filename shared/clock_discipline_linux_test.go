@@ -57,15 +57,16 @@ func TestSntpOffset(t *testing.T) {
 	}
 }
 
-// The timestamp codec is what makes the offset exact, so it is pinned against a
-// known NTP encoding rather than only round-tripped through itself: 1.5s after
-// the NTP epoch must decode to 1900-01-01T00:00:01.5Z, and a full second plus a
-// half must come back bit-identical.
+// The timestamp codec is what makes the offset exact, so it is pinned against
+// known NTP encodings rather than only round-tripped through itself: a full
+// second plus a half must come back bit-identical. The 2037 case covers the
+// era rollover: the wire format wraps to a 1900-era value there, and only era
+// inference can decode it back to the date that was sent.
 func TestNTPTimestampRoundTrip(t *testing.T) {
 	tests := []time.Time{
 		time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC),
 		time.Date(2026, 10, 10, 12, 0, 0, 500000000, time.UTC),
-		time.Date(1900, 1, 1, 0, 0, 1, 500000000, time.UTC),
+		time.Date(2037, 6, 1, 0, 0, 1, 500000000, time.UTC),
 	}
 	for _, want := range tests {
 		b := make([]byte, 8)
@@ -126,6 +127,22 @@ func TestQuerySNTPRejectsBadReplies(t *testing.T) {
 			respond: func(req []byte) []byte {
 				resp := validReply(req)
 				resp[1] = 0 // stratum 0 == KoD
+				return resp
+			},
+		},
+		{
+			name: "leap indicator says the clock is unsynchronized",
+			respond: func(req []byte) []byte {
+				resp := validReply(req)
+				resp[0] = 0xE4 // LI 3, VN 4, mode 4
+				return resp
+			},
+		},
+		{
+			name: "stratum 16 means the server has no reference either",
+			respond: func(req []byte) []byte {
+				resp := validReply(req)
+				resp[1] = 16
 				return resp
 			},
 		},

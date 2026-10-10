@@ -137,13 +137,14 @@ CMDLINE="${SNP_CMDLINE:-console=ttyS0,115200 clocksource=kvm-clock}"
 
 ```go
 logger, _ := NewLoggerFromEnv("tokenhive-tee-broker")
-go DeployClockDiscipline(logger)
+DeployClockDiscipline(logger)
 ```
 
 落点选 broker 有两个原因。broker 以 root 跑（loader 用 `exec.Command(entry)` 起它，不带降权
 `SysProcAttr`），是唯一能改系统时钟的进程，app 侧只有 `CAP_NET_BIND_SERVICE`，改不了钟。
 broker 已经有 root 专属动作的先例，`resetGuestFromBroker` 就是调 `syscall.Reboot`。
-校时必须在 serve 之前起，保证第一次 attestation 就是对着准的钟测的。
+首次校时是同步的，`DeployClockDiscipline` 返回后才进入 serve，所以第一次 attestation
+一定是对着校过的钟测的；之后的周期校时才放进 goroutine。
 
 几个设计选择：
 
@@ -162,10 +163,15 @@ broker 已经有 root 专属动作的先例，`resetGuestFromBroker` 就是调 `
   真实漂移是秒/天级，这个天花板永远碰不到合法校正。
 - **校验 origin stamp。** 服务器回显的 `req[24:32]` 必须等于发出的 `req[40:48]`，
   否则拒掉。这挡的是重放和伪造的回复。
+- **拒收未同步的回复（LI 3、stratum 16+）。** 服务器自己失去参考源时会这样标记，
+  其时间戳是占位值。chrony/ntpd 同样拒收，信它等于让一个退化的源把钟推最多 10 分钟。
+- **纪元推断解码（2036 回绕）。** NTP 的 32 位秒在 2036-02-07 归零，解码时把结果推到
+  本地时钟所处的纪元。否则回绕后的回复会被读成 1900 年前后，偏移量超过 10 分钟上限被拒，
+  校时从此永远失败。
 - **校时失败只告警不改钟**，`logger` 为 nil 也照跑。校时是健康设施，不该因为日志系统建不起来就停摆。
   测不准的时刻就不猜，下个 tick 再试。
 - **成功路径不打日志**，只有失败才 `Warn`。每 15 分钟一行成功日志，噪音大于信息量。
-- **`time.Tick` 而非 `NewTicker` + `defer Stop()`。** 这个函数是永不返回的循环，
+- **`time.Tick` 而非 `NewTicker` + `defer Stop()`。** 承载周期校时的 goroutine 永不返回，
   `defer` 是死代码。
 
 ### 4.3 为什么不是别的做法
@@ -184,7 +190,7 @@ broker 已经有 root 专属动作的先例，`resetGuestFromBroker` 就是调 `
 ### 5.1 单元测试
 
 新增 5 个测试（`shared/clock_discipline_linux_test.go`）：`sntpOffset` 的表驱动三例、
-NTP 时间戳往返与纪元偏移、`applyClockStep` 的拒绝路径、三个畸形回复的拒绝、一个正常回复的接受。
+NTP 时间戳往返与纪元偏移、`applyClockStep` 的拒绝路径、五个畸形回复的拒绝、一个正常回复的接受。
 
 `applyClockStep` 只测拒绝路径（超上限）与 `offset == 0` 的 no-op 分支，**不测接受路径**。
 那是真的 `clock_settime`，单元测试没资格改跑它那台机器的钟。
