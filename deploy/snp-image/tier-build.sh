@@ -19,7 +19,14 @@ APP="${APP_BIN:-/work/mkosi.extra/usr/local/bin/snp-prober}"
 [[ -f "${LOADER}" && -f "${APP}" ]] || { echo "loader/app binary missing: ${LOADER} / ${APP}" >&2; exit 1; }
 KERNEL="$(ls /boot/vmlinuz-* 2>/dev/null | grep -v -- '-rescue' | sort | tail -1)"
 STUB=/usr/lib/systemd/boot/efi/linuxx64.efi.stub
-CMDLINE="${SNP_CMDLINE:-console=ttyS0,115200}"
+# clocksource=kvm-clock is load-bearing, not a preference. Under SEV-SNP the
+# guest defaults to tsc, whose frequency comes back as an uncalibrated nominal
+# ("Detected 2650.000 MHz"); the clocksource watchdog then promotes it over the
+# already-registered kvm-clock. The resulting ~26.5 ppm error desynchronizes the
+# guest from the NitroTPM leaf's NotBefore by ~2.3 s/day, and once that gap
+# exceeds the refresh retry floor no rotation can ever succeed again. Pin the
+# hypervisor-backed clock so timekeeping cannot drift away from attestation.
+CMDLINE="${SNP_CMDLINE:-console=ttyS0,115200 clocksource=kvm-clock}"
 SEED=b5f8a3c2-1d4e-4a6b-9c8d-7e0f1a2b3c4d
 
 # 1) Base initrd: loader as /init (no app code, so app releases do not alter it).
