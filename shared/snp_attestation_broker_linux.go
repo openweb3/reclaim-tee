@@ -73,6 +73,16 @@ func RunSNPAttestationBrokerIfRequested() (bool, error) {
 		return true, fmt.Errorf("SNP attestation broker connection: %w", err)
 	}
 	defer conn.Close()
+
+	// The broker owns the guest's privileged surface, so it is also the only
+	// process that can keep the wall clock honest. Left uncorrected, a drifting
+	// clocksource eventually puts this guest's clock behind the NitroTPM leaf's
+	// NotBefore, and every rotation then fails for good. Start discipline before
+	// serving so the first attestation is already measured against a sane clock.
+	if logger, lerr := NewLoggerFromEnv("tokenhive-tee-broker"); lerr == nil {
+		go DeployClockDiscipline(logger)
+	}
+
 	return true, serveSNPAttestationBroker(conn, generateAWSBrokerEvidence, resetGuestFromBroker)
 }
 
