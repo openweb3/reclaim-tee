@@ -79,9 +79,10 @@ func RunSNPAttestationBrokerIfRequested() (bool, error) {
 	// clocksource eventually puts this guest's clock behind the NitroTPM leaf's
 	// NotBefore, and every rotation then fails for good. Start discipline before
 	// serving so the first attestation is already measured against a sane clock.
-	if logger, lerr := NewLoggerFromEnv("tokenhive-tee-broker"); lerr == nil {
-		go DeployClockDiscipline(logger)
-	}
+	// A logger is wanted but not required: clock discipline must still run on a
+	// broker that could not build one.
+	logger, _ := NewLoggerFromEnv("tokenhive-tee-broker")
+	go DeployClockDiscipline(logger)
 
 	return true, serveSNPAttestationBroker(conn, generateAWSBrokerEvidence, resetGuestFromBroker)
 }

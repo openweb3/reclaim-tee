@@ -61,13 +61,14 @@ const (
 //
 // Safe to call on a guest whose clock is already correct — that is the normal
 // case — and safe to call when no time source is reachable, in which case it
-// leaves the clock alone rather than guessing.
+// leaves the clock alone rather than guessing. A nil logger is tolerated so a
+// broker that could not build one still gets its clock disciplined.
 func DeployClockDiscipline(logger *Logger) {
+	// A correction that cannot be measured must never be guessed at, so a
+	// failure is logged (when there is a logger) and the clock left alone: the
+	// epoch already on record is still serving and the next tick retries.
 	resync := func(what string) {
-		if err := syncClockOnce(); err != nil {
-			// A failed correction is not fatal: the epoch already on record is
-			// still serving and the next tick retries. Logging every failure
-			// keeps a growing skew visible before it becomes fatal.
+		if err := syncClockOnce(); err != nil && logger != nil {
 			logger.Warn(what+" failed; wall clock unchanged", zap.Error(err))
 		}
 	}
