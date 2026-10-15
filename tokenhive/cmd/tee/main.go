@@ -206,18 +206,7 @@ func main() {
 		if !loggerAvailable {
 			log.Printf("timing level %s is on, but the structured logger is unavailable: no record will reach a log", level)
 		}
-		// Two destinations from one record, and every record reaches both: the
-		// store is what an operator pulls and has to hold the detail at any
-		// level, while the log sink is where the level decides how much is
-		// written. The store is first so that a slow write to the serial
-		// console cannot delay what a pull will find — the store is the copy
-		// that has to survive having been asleep at the console.
-		sinks := tee.TimingSinks{}
-		if metricsStore != nil {
-			sinks = append(sinks, metricsStore)
-		}
-		sinks = append(sinks, timingSink{log: logger.Logger, level: level})
-		reporter := tee.NewTimingReporter(sinks, *timingWindow)
+		reporter := newTimingStack(level, metricsStore, logger.Logger, *timingWindow)
 		go reporter.Run(context.Background())
 		timing = &tee.TimingConfig{Level: level, Sink: reporter, StallThreshold: *timingStall}
 		logger.Info("timing instrumentation on",
@@ -405,6 +394,14 @@ func main() {
 		}()
 	}
 
+	// What the process actually parsed, next to the launcher's line saying what
+	// it put in the environment. The two are meant to read identically, and a
+	// duration the tee's own parser could not read is the one case where they do
+	// not: it falls back to the 2m default without complaining, so without this
+	// line a typo in the launch would look exactly like the change never having
+	// been applied.
+	log.Printf("one provider exchange may run %s", *requestTimeout)
+
 	if *serveMTLS {
 		log.Printf("tee (platform=%s, includeEvidence=%t, mtls) listening on https://%s",
 			*platformName, *includeEvidence, *addr)
@@ -475,6 +472,28 @@ func relayHeaders(key string) http.Header {
 type timingSink struct {
 	log   *zap.Logger
 	level tee.TimingLevel
+}
+
+// newTimingStack is the whole of the process edge's instrumentation wiring: the
+// store an operator pulls, the log sink the level governs, and the reporter that
+// folds a summary over both.
+//
+// It is a function rather than four lines inside main because the arrangement is
+// what carried one of the ways this feature went wrong: a store behind the
+// reporter's level gate served an empty ring at summary, which is the level a
+// long-running deployment is told to run at. Whether every record reaches the
+// store is a property of the order these sinks are in, so the order is what the
+// test pins.
+func newTimingStack(level tee.TimingLevel, store *metrics.Store, logger *zap.Logger, window time.Duration) *tee.TimingReporter {
+	sinks := tee.TimingSinks{}
+	if store != nil {
+		// First, so that a slow write to the serial console cannot delay what a
+		// pull will find: the store is the copy that has to survive having been
+		// asleep at the console.
+		sinks = append(sinks, store)
+	}
+	sinks = append(sinks, timingSink{log: logger, level: level})
+	return tee.NewTimingReporter(sinks, window)
 }
 
 // The service is handed this as a tee.TimingSink, so a drift in the interface

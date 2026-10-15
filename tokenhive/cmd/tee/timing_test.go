@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/metrics"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
@@ -129,6 +132,46 @@ func TestTimingSinkRendersAStall(t *testing.T) {
 	}
 	if _, present := line["outcome"]; present {
 		t.Error("a stall is not an outcome")
+	}
+}
+
+// TestTimingStackFeedsTheStoreAtEveryLevel is a review finding as a test. The
+// store used to sit behind the reporter's level gate, so at summary — the level
+// a long-running deployment is told to use — nothing but a stall reached the
+// ring and a pull served an empty records list: the detail channel this design
+// leans on was dark in exactly the mode it was meant for. Both halves passed
+// their own tests while that was true, because the bug was in the arrangement,
+// so the arrangement is what is pinned here: whatever the level, the request
+// reaches the store, and a log gets only what the level asked for.
+func TestTimingStackFeedsTheStoreAtEveryLevel(t *testing.T) {
+	for _, level := range []tee.TimingLevel{tee.TimingSummary, tee.TimingFull} {
+		store := metrics.NewStore("tokenhive-tee", 8)
+		sink, buf := newTimingTestSink(t, level)
+		reporter := newTimingStack(level, store, sink.log, time.Minute)
+		reporter.TimingRequest(tee.TimingRecord{
+			JobID:   "9f3a",
+			Outcome: tee.TimingComplete,
+			Stages:  []tee.TimingStage{{Name: tee.StageTTFB, Dur: time.Second}},
+		})
+
+		mux := http.NewServeMux()
+		metrics.NewHTTPServer(store, mux)
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/timing", nil))
+
+		var pulled struct {
+			Served  int              `json:"served"`
+			Records []map[string]any `json:"records"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &pulled); err != nil {
+			t.Fatalf("decode pull %q: %v", recorder.Body.String(), err)
+		}
+		if pulled.Served != 1 || len(pulled.Records) != 1 || pulled.Records[0]["job"] != "9f3a" {
+			t.Errorf("level %v: pull served %d/%d records (%v), want the one request", level, pulled.Served, len(pulled.Records), pulled.Records)
+		}
+		if logged := buf.Len() > 0; logged != (level == tee.TimingFull) {
+			t.Errorf("level %v wrote %q to the log, want a line at full and none at summary", level, buf.String())
+		}
 	}
 }
 
