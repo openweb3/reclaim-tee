@@ -613,17 +613,28 @@ func (t *Timings) Closed() bool {
 // Stall returns a record of the stage the request has not left. Its Stages are
 // the stages that did finish: the open one is not among them, because nothing
 // closed it.
-func (t *Timings) Stall() TimingRecord {
+//
+// It reports false for a record that has closed, and that is not a courtesy:
+// a watcher's check of Closed and its call to Stall are two moments, and the
+// request can end between them. A snapshot taken across that gap would arrive
+// *after* the record it belongs to, describing a finished request as one that
+// is still running — the one shape of entry a reader of the pull cannot tell
+// from the truth. Deciding it here, under the same lock Close takes, is what
+// makes the two atomic.
+func (t *Timings) Stall() (TimingRecord, bool) {
 	if t == nil {
-		return TimingRecord{}
+		return TimingRecord{}, false
 	}
 	now := time.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.closed {
+		return TimingRecord{}, false
+	}
 	rec := t.recordLocked(TimingRunning)
 	rec.At = now
 	rec.Stage, rec.Waited = t.open, now.Sub(t.openedAt)
-	return rec
+	return rec, true
 }
 
 // Close ends the record and returns it, final.

@@ -309,7 +309,8 @@ func (s *Service) reportTiming(rec TimingRecord) {
 }
 
 // watchStall reports a request that has sat in one stage past the threshold,
-// once when it crosses and then only after four more thresholds.
+// once when it crosses and then only after four more thresholds in that same
+// stage.
 //
 // The spacing is the point of the thing. A long stage is not automatically a
 // fault — a provider thinking for twenty seconds is a normal request, and its
@@ -317,6 +318,12 @@ func (s *Service) reportTiming(rec TimingRecord) {
 // with exactly the healthiest requests in the system. Four thresholds apart, a
 // wedged request still says so several times before its own exchange timeout
 // kills it, while a slow but healthy one costs a line or two.
+//
+// The spacing is per stage, and a request that moves to a different slow stage
+// reports at once. That is not the same event: what a report about a request
+// that sat in tls says nothing about a request that is now wedged in ttfb, and
+// holding the second behind the first would keep the stage it is actually stuck
+// in dark for minutes.
 //
 // The returned function stops the watcher. It is a no-op for an uninstrumented
 // service or a nil record, so the caller's defer is unconditional.
@@ -346,6 +353,7 @@ func (s *Service) watchStall(tm *Timings) (stop func()) {
 	go func() {
 		ticker := time.NewTicker(cadence)
 		defer ticker.Stop()
+		var lastStage string
 		var lastReported time.Time
 		for {
 			select {
@@ -358,11 +366,20 @@ func (s *Service) watchStall(tm *Timings) (stop func()) {
 					return
 				}
 				stage, waited := tm.Current()
-				if stage == "" || waited < threshold || now.Sub(lastReported) < 4*threshold {
+				if stage == "" || waited < threshold {
 					continue
 				}
-				s.reportTiming(tm.Stall())
-				lastReported = now
+				if stage == lastStage && now.Sub(lastReported) < 4*threshold {
+					continue
+				}
+				rec, stalled := tm.Stall()
+				if !stalled {
+					// The record closed between the two calls: there is nothing
+					// left to report, and nothing left to watch.
+					return
+				}
+				s.reportTiming(rec)
+				lastStage, lastReported = stage, now
 			}
 		}
 	}()

@@ -51,7 +51,15 @@ func (s *recordingSink) summaries() []TimingAggregate {
 // goroutine, so there is no event to select on and a poll is the honest shape.
 func (s *recordingSink) waitFor(t *testing.T, match func(TimingRecord) bool) TimingRecord {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	return s.waitForWithin(t, 10*time.Second, match)
+}
+
+// waitForWithin is waitFor with the deadline chosen by the caller. A test whose
+// point is *when* a record arrived has to say how long it was prepared to wait,
+// or "eventually" hides the very throttle it means to pin.
+func (s *recordingSink) waitForWithin(t *testing.T, within time.Duration, match func(TimingRecord) bool) TimingRecord {
+	t.Helper()
+	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		for _, rec := range s.records() {
 			if match(rec) {
@@ -214,12 +222,23 @@ func TestTimingsStallNamesTheOpenStage(t *testing.T) {
 		t.Errorf("Current() = %q/%v, want %s with >= 5ms", stage, waited, StageTLS)
 	}
 
-	stall := tm.Stall()
+	stall, open := tm.Stall()
+	if !open {
+		t.Fatal("Stall() on a record still inside a stage reported nothing")
+	}
 	if stall.Outcome != TimingRunning || stall.Stage != StageTLS || stall.Waited < 5*time.Millisecond {
 		t.Errorf("stall = %+v, want a running record in %s", stall, StageTLS)
 	}
 	if got, want := stagesOf(stall), []string{StageRead}; !sameNames(got, want) {
 		t.Errorf("stall stages = %v, want %v (the open one is not closed)", got, want)
+	}
+
+	// A snapshot taken after the end is refused rather than emitted: it would
+	// land behind the record it belongs to, describing a request that had
+	// already finished as one still running.
+	tm.Close(TimingComplete, nil)
+	if rec, open := tm.Stall(); open {
+		t.Errorf("Stall() after Close() = %+v, want no record", rec)
 	}
 }
 
@@ -240,8 +259,8 @@ func TestTimingsAreNilSafe(t *testing.T) {
 	if !tm.Closed() {
 		t.Error("a nil record must read as closed, or a watcher would wait on it forever")
 	}
-	if got := tm.Stall(); got.Outcome != TimingRunning || got.Stage != "" {
-		t.Errorf("Stall() on a nil record = %+v, want the zero record", got)
+	if rec, open := tm.Stall(); open || rec.Stage != "" || rec.Outcome != TimingRunning {
+		t.Errorf("Stall() on a nil record = %+v/%v, want the zero record and false", rec, open)
 	}
 	if got := tm.Close(TimingComplete, nil); got.Outcome != TimingRunning {
 		t.Errorf("Close() on a nil record = %+v, want the zero record", got)
@@ -332,6 +351,49 @@ func TestTimingReporterSummarisesAWindow(t *testing.T) {
 	if last.Requests != 1 || statOf(t, last, StageTTFB).Samples != 1 {
 		t.Errorf("window after the flush = %+v, want exactly the one request that arrived", last)
 	}
+}
+
+// TestStallWatcherReportsEachNewStage pins what the spacing is per. A request
+// that leaves one slow stage for another has something new to say, and this is
+// the timing that says so: 150ms into the second stage, against a spacing of
+// four thresholds from the first report. A throttle that counted per request
+// could not have produced it yet, and the stage the request is actually stuck
+// in would stay dark while its own timeout ran out.
+func TestStallWatcherReportsEachNewStage(t *testing.T) {
+	const threshold = 150 * time.Millisecond
+	acquire, tlsHold := make(chan struct{}), make(chan struct{})
+	sink := &recordingSink{}
+	env := newTestEnv(t, func(cfg *Config) {
+		cfg.Transport = &markingTransport{
+			stages: []string{StageAcquire, StageTLS},
+			waits:  map[string]chan struct{}{StageAcquire: acquire, StageTLS: tlsHold},
+		}
+		cfg.Timing = &TimingConfig{Level: TimingFull, Sink: sink, StallThreshold: threshold}
+	})
+
+	payload := []byte(`{"model":"m"}`)
+	spec := env.spec(t, payload)
+	body, err := ExecuteRequest{Spec: spec, Body: payload}.EncodeCanonical()
+	if err != nil {
+		t.Fatalf("encode execute request: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ServeExecute(env.service, httptest.NewRecorder(),
+			httptest.NewRequest(http.MethodPost, "/v1/execute", bytes.NewReader(body)))
+	}()
+
+	first := sink.waitFor(t, func(r TimingRecord) bool { return r.Outcome == TimingRunning })
+	if first.Stage != StageAcquire {
+		t.Fatalf("first stall = %s, want the stage the request is really in", first.Stage)
+	}
+	close(acquire)
+	sink.waitForWithin(t, 400*time.Millisecond, func(r TimingRecord) bool {
+		return r.Outcome == TimingRunning && r.Stage == StageTLS
+	})
+	close(tlsHold)
+	<-done
 }
 
 // sleepySink takes a measurable amount of time to accept a record, standing in
@@ -425,6 +487,10 @@ type markingTransport struct {
 	stages []string
 	// hold, when non-nil, keeps Do inside its last marked stage until closed.
 	hold chan struct{}
+	// waits, when non-nil, holds the exchange after the named stage is marked
+	// until that channel is closed. It is how one request is made to sit in two
+	// different stages in sequence, which is what a per-stage throttle is about.
+	waits map[string]chan struct{}
 	// err is returned after the chunks, for the failure path.
 	err error
 
@@ -435,6 +501,9 @@ func (m *markingTransport) Do(ctx context.Context, req Request, onChunk func([]b
 	tm := TimingsFrom(ctx)
 	for _, name := range m.stages {
 		tm.Mark(name)
+		if ch, ok := m.waits[name]; ok {
+			<-ch
+		}
 	}
 	if m.hold != nil {
 		<-m.hold
