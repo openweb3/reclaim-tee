@@ -52,6 +52,12 @@ type Request struct {
 	// Timeout bounds the whole exchange. Zero means no service-level deadline
 	// beyond the context.
 	Timeout time.Duration
+
+	// JobID identifies the job this request belongs to. It is never put on the
+	// wire: a transport uses it to name the job in a line about a connection,
+	// which is the only way a failure at this layer can be tied to the request
+	// that needed it. Empty means the caller supplied none.
+	JobID []byte
 }
 
 // Response is what the provider sent back, minus the body.
@@ -85,6 +91,12 @@ type StartFunc func(Response)
 // unchanged) is invoked exactly once, after the response headers are parsed
 // and before the first chunk. nil or omitted means the caller discards the
 // start; the service still hashes the headers into the receipt either way.
+//
+// A transport that performs its own network work may mark the stages it owns on
+// the record carried by ctx (see TimingsFrom): acquiring a connection, dialling,
+// the TLS handshake, the write, the wait for the response headers and the body
+// are all intervals only the transport can measure. Marking a nil record is a
+// no-op, so an uninstrumented caller needs no branch.
 //
 // Implementations must not retry. A retry would send the credential twice and
 // produce a response that no longer corresponds to a single signed execution.
