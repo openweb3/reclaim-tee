@@ -133,7 +133,7 @@ func (r ExecuteRequest) Job() Job { return Job{Spec: r.Spec, Body: r.Body} }
 // whatever the sink costs is paid before this response's stream closes. That is
 // deliberate: the alternative is a goroutine per request, which buys a little
 // latency at the cost of the ordering that makes a record trustworthy, and the
-// cost is measured and reported (see TimingAggregate.SinkP95) precisely so that
+// cost is measured and reported (the summary's own sink stage) precisely so that
 // "the instrumentation made this slow" stays a number rather than a suspicion.
 func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 	tm := svc.newTimings()
