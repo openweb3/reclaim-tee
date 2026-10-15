@@ -69,6 +69,13 @@ var (
 	ErrCredentialClash = errors.New("job already sets the header the credential occupies")
 	ErrBodyTooLarge    = errors.New("request body exceeds the policy limit")
 	ErrNoCredential    = errors.New("job carries no credential")
+
+	// ErrNoTimingSink means a timing level was configured with nothing to send
+	// it to. Like ErrNoTransport it is a wiring error and it is refused rather
+	// than tolerated: a TEE asked to measure itself and silently dropping every
+	// record looks instrumented and is not, which is a worse state to debug
+	// from than no instrumentation at all.
+	ErrNoTimingSink = errors.New("timing level configured without a sink")
 )
 
 // ErrBodyMismatch means the supplied request body does not hash to the digest
@@ -207,6 +214,13 @@ type Config struct {
 	// Mandatory — a service that cannot decrypt its jobs' credentials cannot
 	// execute them.
 	InboxKey *InboxKey
+
+	// Timing, when non-nil, instruments the service: each request gets a
+	// record of how long every stage of it took, and the sink decides what
+	// becomes of it. Nil is the default and means the service measures
+	// nothing, taking no clock readings and allocating no record — see
+	// timing.go for why that has to be a property rather than a promise.
+	Timing *TimingConfig
 }
 
 // Service executes jobs inside the enclave. It is safe for concurrent use.
@@ -220,6 +234,7 @@ type Service struct {
 	requestTimeout  time.Duration
 	submitterVerify func(ctx context.Context, spec jobs.Spec) error
 	inbox           *InboxKey
+	timing          *TimingConfig
 }
 
 // NewService validates a configuration and returns a ready service.
@@ -239,6 +254,16 @@ func NewService(cfg Config) (*Service, error) {
 	if cfg.Seq == nil {
 		return nil, ErrNoSeqStore
 	}
+	if cfg.Timing != nil && cfg.Timing.Level != TimingOff && cfg.Timing.Sink == nil {
+		return nil, ErrNoTimingSink
+	}
+	timing := cfg.Timing
+	if timing != nil && timing.Level == TimingOff {
+		// An explicitly-off configuration is the same service as no
+		// configuration: keeping the struct would leave every hot path
+		// checking a pointer that is always false.
+		timing = nil
+	}
 	clock := cfg.Clock
 	if clock == nil {
 		clock = time.Now
@@ -253,7 +278,95 @@ func NewService(cfg Config) (*Service, error) {
 		requestTimeout:  cfg.RequestTimeout,
 		submitterVerify: cfg.SubmitterVerifier,
 		inbox:           cfg.InboxKey,
+		timing:          timing,
 	}, nil
+}
+
+// newTimings opens an instrumentation record for one request, or returns nil
+// when the service carries none. The handler owns the record: it hands it to
+// the layers that mark stages (see WithTimings) and reports it when the request
+// is over.
+//
+// A nil receiver is not instrumented either, and that is deliberate rather
+// than defensive: /v1/execute bounds and decodes the request body before it
+// consults the service at all, and the test that pins that order asserts it by
+// passing no service. Instrumentation must not be the thing that makes a
+// pre-service refusal reach for a service.
+func (s *Service) newTimings() *Timings {
+	if s == nil || s.timing == nil {
+		return nil
+	}
+	return NewTimings()
+}
+
+// reportTiming sends one record to the sink. A no-op for a service with no
+// instrumentation, so a caller never has to ask.
+func (s *Service) reportTiming(rec TimingRecord) {
+	if s == nil || s.timing == nil {
+		return
+	}
+	s.timing.Sink.TimingRequest(rec)
+}
+
+// watchStall reports a request that has sat in one stage past the threshold,
+// once when it crosses and then only after four more thresholds.
+//
+// The spacing is the point of the thing. A long stage is not automatically a
+// fault — a provider thinking for twenty seconds is a normal request, and its
+// time is charged to ttfb and body — so a report every tick would fill the log
+// with exactly the healthiest requests in the system. Four thresholds apart, a
+// wedged request still says so several times before its own exchange timeout
+// kills it, while a slow but healthy one costs a line or two.
+//
+// The returned function stops the watcher. It is a no-op for an uninstrumented
+// service or a nil record, so the caller's defer is unconditional.
+//
+// It costs one goroutine per in-flight request, waking at most every five
+// seconds and only while a request is running. That is nothing at the
+// concurrency this serves, and an uninstrumented service never starts one — but
+// it is a per-request cost, so it belongs in the open rather than assumed.
+func (s *Service) watchStall(tm *Timings) (stop func()) {
+	if s == nil || s.timing == nil || tm == nil {
+		return func() {}
+	}
+	threshold := s.timing.StallThreshold
+	if threshold == 0 {
+		threshold = DefaultStallThreshold
+	}
+	if threshold < 0 {
+		return func() {}
+	}
+	// The wake-up cadence is derived rather than fixed so a deployment that
+	// lowers the threshold does not keep a five-second granularity beneath it,
+	// and so a test can observe a stall without waiting out a real one.
+	cadence := min(threshold/2, 5*time.Second)
+	cadence = max(cadence, 10*time.Millisecond)
+
+	stopped := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(cadence)
+		defer ticker.Stop()
+		var lastReported time.Time
+		for {
+			select {
+			case <-stopped:
+				return
+			case now := <-ticker.C:
+				// A finished record has nothing left to report and nothing
+				// left to watch.
+				if tm.Closed() {
+					return
+				}
+				stage, waited := tm.Current()
+				if stage == "" || waited < threshold || now.Sub(lastReported) < 4*threshold {
+					continue
+				}
+				s.reportTiming(tm.Stall())
+				lastReported = now
+			}
+		}
+	}()
+	return sync.OnceFunc(func() { close(stopped) })
 }
 
 // activeSigner is the signer receipts are issued with right now: the rotation
@@ -483,6 +596,8 @@ func signerStaleAt(signer *proof.Signer, now time.Time) bool {
 // `if err != nil { return }` and take the evidence with it. The invariant is
 // therefore that error is non-nil if and only if Result is nil.
 func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onStart ...StartFunc) (*Result, error) {
+	tm := TimingsFrom(ctx)
+	tm.Mark(StageGate)
 	now := s.clock()
 	signer := s.activeSigner()
 
@@ -538,11 +653,13 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onSta
 			ErrBodyTooLarge, len(job.Body), decision.MaxBodyBytes)
 	}
 
+	tm.Mark(StageCred)
 	headers, err := s.injectCredential(job.Spec)
 	if err != nil {
 		return nil, err
 	}
 
+	tm.Mark(StageHash)
 	specHash, err := job.Spec.Hash()
 	if err != nil {
 		return nil, err
@@ -559,6 +676,7 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onSta
 	// hidden. That is the right way round — a gap invites a question, while a
 	// number reused after a crash would let a hidden receipt pass as accounted
 	// for.
+	tm.Mark(StageSeq)
 	seq, err := s.seq.Next([]byte(job.Spec.Provider))
 	if err != nil {
 		return nil, fmt.Errorf("allocate provider sequence: %w", err)
@@ -575,6 +693,7 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onSta
 		Stream:           job.Spec.Stream,
 		MaxResponseBytes: decision.MaxResponseBytes,
 		Timeout:          s.requestTimeout,
+		JobID:            job.Spec.JobID,
 	}
 
 	// Stop-loss for a rotation that failed, invisible on a healthy platform.
@@ -673,6 +792,7 @@ func (s *Service) perform(
 ) (*Result, error) {
 	hasher := proof.NewStreamingHasher(spec.JobID)
 	truncated := false
+	tm := TimingsFrom(ctx)
 
 	// The signer this exchange starts under is the one its receipt should name.
 	// A receipt is held to the attested key of the connection that carried it,
@@ -762,6 +882,17 @@ func (s *Service) perform(
 	startedAt := s.clock().Unix()
 	response, err := s.transport.Do(ctx, request, relay, start)
 	finishedAt := s.clock().Unix()
+
+	// What the provider sent is final the moment the exchange returns, whatever
+	// it returned with, so the record takes it here rather than at the end —
+	// a failed exchange still has a transcript worth counting.
+	tm.SetTraffic(totalBytes, totalChunks)
+
+	// Everything from here to the signature: the completion decision, the
+	// status, the transcript digest and the receipt itself. It is one stage
+	// because it is one block of work with no I/O in it, and splitting it would
+	// be measuring the cost of measuring.
+	tm.Mark(StageSign)
 
 	completion := proof.CompletionComplete
 	switch {
@@ -1008,6 +1139,7 @@ func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 		Headers:  headers,
 		Stream:   true,
 		Timeout:  s.requestTimeout,
+		JobID:    job.Spec.JobID,
 	}
 	conn, err := opener.OpenSession(ctx, request)
 	if err != nil {

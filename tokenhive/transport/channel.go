@@ -236,6 +236,11 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 		onChunk = func([]byte) error { return nil }
 	}
 
+	// The record carried by ctx collects this exchange's stages. It is nil
+	// whenever the caller is not instrumented, and every mark below is then a
+	// no-op — see tee.TimingsFrom.
+	tm := tee.TimingsFrom(ctx)
+	tm.Mark(tee.StageAcquire)
 	ch, err := m.acquire(ctx, req)
 	if err != nil {
 		return tee.Response{}, err
@@ -244,7 +249,13 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 	if err != nil && ch.wroteNothing() {
 		// A dead pooled socket cost this request nothing but the excursion.
 		// Nothing left the TEE, so re-dial exactly once instead of failing.
+		//
+		// The second acquisition is marked too, so acquire and write carry the
+		// totals of a request that paid for both twice. That is what happened:
+		// the request really did pick up a connection, lose it unprompted, and
+		// pay for another.
 		m.release(ch, false)
+		tm.Mark(tee.StageAcquire)
 		ch, err = m.acquire(ctx, req)
 		if err != nil {
 			return tee.Response{}, err
@@ -421,7 +432,16 @@ func (m *ChannelManager) release(ch *channel, keep bool) {
 // reverse tunnel; without a relay it is a direct TCP connection (transport
 // tests and colocated simulation runs). In both cases TLS terminates here,
 // inside the TEE, and the provider name never appears on the wire.
+//
+// Being called at all means this request is paying for a connection: the record
+// says so (SetCold), and the two stages it owns are marked around the work that
+// makes it slow. On the first request of a process the dial also establishes
+// the tunnel to the Hub, so it is the one stage whose duration can be measured
+// in seconds.
 func (m *ChannelManager) dialTCP(ctx context.Context, req tee.Request) (net.Conn, error) {
+	tm := tee.TimingsFrom(ctx)
+	tm.SetCold()
+	tm.Mark(tee.StageDial)
 	var conn net.Conn
 	var err error
 	if m.relay != nil {
@@ -436,16 +456,17 @@ func (m *ChannelManager) dialTCP(ctx context.Context, req tee.Request) (net.Conn
 	if m.scheme != "https" {
 		return conn, nil
 	}
-	return m.wrapTLS(ctx, conn, req.Host)
+	tm.Mark(tee.StageTLS)
+	return m.wrapTLS(ctx, conn, req)
 }
 
 // wrapTLS upgrades a raw provider pipe to TLS with the config the manager was
 // given. The trust roots determine what the TEE will attest against; only the
 // roots and a minimum version are customised, and the handshake/record layers
 // are standard.
-func (m *ChannelManager) wrapTLS(ctx context.Context, conn net.Conn, host string) (net.Conn, error) {
+func (m *ChannelManager) wrapTLS(ctx context.Context, conn net.Conn, req tee.Request) (net.Conn, error) {
 	tlsCfg := &tls.Config{
-		ServerName: serverName(host),
+		ServerName: serverName(req.Host),
 		// The caller's TLS config is optional: nil means the platform defaults,
 		// which in production is the system trust store — the C4 checklist's
 		// "Channel TLS roots = system roots" requirement is simply the default
@@ -472,8 +493,13 @@ func (m *ChannelManager) wrapTLS(ctx context.Context, conn net.Conn, host string
 		// error only becomes a receipt's CompletionFailed, and the Hub sees a
 		// closed relay stream and a byte count — never the reason. A trust-store
 		// mistake and a network drop are indistinguishable from outside without
-		// this line.
-		log.Printf("upstream TLS handshake to %s failed: %v", host, err)
+		// this line. The job is named when the caller supplied one, so a line
+		// about a connection can be tied to the request that needed it.
+		if len(req.JobID) > 0 {
+			log.Printf("upstream TLS handshake to %s failed (job %x): %v", req.Host, req.JobID, err)
+		} else {
+			log.Printf("upstream TLS handshake to %s failed: %v", req.Host, err)
+		}
 		_ = conn.Close()
 		return nil, err
 	}

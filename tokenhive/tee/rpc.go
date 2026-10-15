@@ -123,16 +123,39 @@ func (r ExecuteRequest) Job() Job { return Job{Spec: r.Spec, Body: r.Body} }
 //
 // A refusal is reported as an EventError frame, so the caller learns why
 // without a credential ever being touched.
+//
+// It also owns the request's instrumentation record: it opens one, hands it to
+// the layers that mark stages, and reports it when the request is over — on
+// every path, including the refusals below, because a Hub that cannot deliver a
+// body in time is one of the conditions the record exists to make visible.
+//
+// The report runs inside the handler, on the request's own goroutine, so
+// whatever the sink costs is paid before this response's stream closes. That is
+// deliberate: the alternative is a goroutine per request, which buys a little
+// latency at the cost of the ordering that makes a record trustworthy, and the
+// cost is measured and reported (see TimingAggregate.SinkP95) precisely so that
+// "the instrumentation made this slow" stays a number rather than a suspicion.
 func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
+	tm := svc.newTimings()
+	stopStall := svc.watchStall(tm)
+	defer stopStall()
+	var (
+		outcome   = TimingFailed
+		timingErr error
+	)
+	defer func() { svc.reportTiming(tm.Close(outcome, timingErr)) }()
+
 	// Bound the request twice before reading a byte: a read deadline so a peer
 	// that dribbles the body cannot pin the connection, and a size limit so a
 	// declared length cannot allocate unbounded memory. The read of one extra
 	// byte past the cap is what distinguishes "exactly at the cap" from "over
 	// it" without trusting Content-Length.
+	tm.Mark(StageRead)
 	control := http.NewResponseController(w)
 	_ = control.SetReadDeadline(time.Now().Add(executeReadTimeout))
 	raw, err := io.ReadAll(io.LimitReader(r.Body, MaxExecuteBody+1))
 	if err != nil {
+		timingErr = err
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}
@@ -142,6 +165,7 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 		// be reused. Cleared here, that drain would be unbounded and a peer that
 		// dribbles an oversized chunked body could pin the connection — exactly
 		// what the deadline exists to prevent.
+		timingErr = fmt.Errorf("request body exceeds the %d byte cap", MaxExecuteBody)
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -156,9 +180,13 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 	_ = control.SetReadDeadline(time.Time{})
 	req, err := DecodeExecuteRequest(raw)
 	if err != nil {
+		timingErr = err
 		http.Error(w, "decode request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// The record can only name the job once the spec is in hand, which is why a
+	// stall reported before this point carries no job ID.
+	tm.Identify(req.Spec.JobID, req.Spec.Provider, req.Spec.Host, req.Spec.Method, req.Spec.Stream)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -172,6 +200,21 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}
+	if tm != nil {
+		// Time the egress only when there is a record to put it in. The two
+		// clock readings are cheap, but they are paid per chunk of every
+		// response, and an uninstrumented TEE should not pay them for a number
+		// nobody asked for — the same rule every other mark follows.
+		onChunk = func(chunk []byte) error {
+			at := time.Now()
+			writeChunkFrame(w, chunk)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			tm.AddEgress(time.Since(at))
+			return nil
+		}
+	}
 	onStart := func(resp Response) {
 		writeStartFrame(w, resp)
 		if flusher != nil {
@@ -179,17 +222,24 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res, err := svc.Execute(r.Context(), req.Job(), onChunk, onStart)
+	res, err := svc.Execute(WithTimings(r.Context(), tm), req.Job(), onChunk, onStart)
 	if err != nil {
+		timingErr = err
 		writeEvent(w, flusher, EventError, err.Error())
 		return
 	}
+	tm.Mark(StageEmit)
 	enc, err := res.Receipt.EncodeCanonical()
 	if err != nil {
+		timingErr = err
 		writeEvent(w, flusher, EventError, "encode receipt: "+err.Error())
 		return
 	}
 	writeEvent(w, flusher, EventReceipt, base64.StdEncoding.EncodeToString(enc))
+	// The record's outcome is the receipt's own completion state, read off the
+	// proof rather than decided again: a log line and the signed evidence of
+	// the same request cannot then disagree about whether it finished whole.
+	outcome = res.Receipt.Receipt.Completion
 }
 
 // writeStartFrame emits the response-start frame: the upstream status and the

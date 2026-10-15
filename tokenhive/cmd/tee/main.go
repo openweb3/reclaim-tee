@@ -49,11 +49,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.uber.org/zap"
+
 	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/metrics"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/transport"
@@ -63,6 +66,11 @@ import (
 // attestation epoch whose evidence shape matches a real SEV-SNP report but
 // whose trust root is just a generated key.
 const defaultPlatform = "simulated"
+
+// serviceName is what this process calls itself in the structured logger and in
+// the instrumentation endpoint's responses, so a pulled record and a shipped
+// log line agree about which process produced them.
+const serviceName = "tokenhive-tee"
 
 func main() {
 	// Under the measured loader the loader launches this binary twice: once as a
@@ -92,6 +100,19 @@ func main() {
 	relayKey := flag.String("relay-key", rootShared.GetEnvOrDefault("TEE_RELAY_KEY", ""), "key to present to the Hub's TeeRelay endpoint (empty = the Hub requires none)")
 	maxConns := flag.Int("max-conns", rootShared.GetEnvIntOrDefault("TEE_MAX_CONNS", 0), "max resident provider connections per (provider, host) (0 = default 32)")
 	requestTimeout := flag.Duration("request-timeout", rootShared.GetEnvDurationOrDefault("TEE_REQUEST_TIMEOUT", 2*time.Minute), "bound on a single provider exchange, including streaming sessions (0 = no bound)")
+	// Instrumentation. Every one of the three is env-driven like the rest, so
+	// the measured bundle is byte-identical whether a deployment profiles itself
+	// or not: turning it on costs a TEE restart, not a rebuild.
+	timingLevel := flag.String("timing", rootShared.GetEnvOrDefault("TEE_TIMING", "off"), "instrumentation: off, summary (one aggregate line per window) or full (plus one line per request)")
+	timingWindow := flag.Duration("timing-window", rootShared.GetEnvDurationOrDefault("TEE_TIMING_WINDOW", tee.DefaultTimingWindow), "how long one instrumentation summary covers")
+	timingStall := flag.Duration("timing-stall", rootShared.GetEnvDurationOrDefault("TEE_TIMING_STALL", tee.DefaultStallThreshold), "report a request that has sat in one stage this long (negative = never)")
+	// The pullable half of the instrumentation. Empty means no endpoint at all,
+	// and loopback is not the default because there is nothing to pull it with
+	// on a machine that has no sshd: a deployment that wants the endpoint says
+	// where it listens, and reaches it over the network with the security group
+	// as the gate.
+	metricsAddr := flag.String("metrics-addr", rootShared.GetEnvOrDefault("TEE_METRICS_ADDR", ""), "listen address for the instrumentation endpoint, e.g. 0.0.0.0:18092 (empty = off)")
+	metricsRetain := flag.Int("metrics-retain", rootShared.GetEnvIntOrDefault("TEE_METRICS_RETAIN", 0), "how many request records the instrumentation endpoint retains (0 = default)")
 	seqPath := flag.String("seq", os.Getenv("TEE_SEQ"), "ProviderSeq store file (default <simdir>/seqstore.json)")
 	platformName := flag.String("platform", rootShared.GetEnvOrDefault("TEE_PLATFORM", defaultPlatform), "attestation platform: simulated, sevsnp")
 	includeEvidence := flag.Bool("evidence", rootShared.GetEnvBoolOrDefault("TEE_EVIDENCE", true), "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
@@ -160,11 +181,53 @@ func main() {
 	}
 	epoch, serverTLS := assembly.Epoch, assembly.ServerTLS
 	// A logger failure is not worth refusing to start an enclave over: nothing
-	// below depends on the sink, and the console fallback is fine.
-	logger, err := rootShared.NewLoggerFromEnv("tokenhive-tee")
+	// below depends on the sink, and the console fallback is fine. It is worth
+	// naming loudly when instrumentation is on, though — a TEE asked to measure
+	// itself and reporting into a no-op sink looks instrumented and is not.
+	logger, err := rootShared.NewLoggerFromEnv(serviceName)
+	loggerAvailable := err == nil
 	if err != nil {
-		log.Printf("structured logger unavailable (%v); publications and rotations will go unlogged", err)
+		log.Printf("structured logger unavailable (%v); publications, rotations and timing records will go unlogged", err)
 		logger = rootShared.NewNopLogger()
+	}
+	level, err := tee.ParseTimingLevel(*timingLevel)
+	if err != nil {
+		log.Fatalf("timing: %v", err)
+	}
+	// The pullable store. It is built whenever the endpoint is on, whether or
+	// not the service is recording, so that an operator who finds an empty ring
+	// finds it next to the line that explains why.
+	var metricsStore *metrics.Store
+	if *metricsAddr != "" {
+		metricsStore = metrics.NewStore(serviceName, *metricsRetain)
+	}
+	var timing *tee.TimingConfig
+	if level != tee.TimingOff {
+		if !loggerAvailable {
+			log.Printf("timing level %s is on, but the structured logger is unavailable: no record will reach a log", level)
+		}
+		// Two destinations from one record, and the level decides what is
+		// produced rather than which destination gets it: an operator has one
+		// knob, and every channel sees what that knob asked for. The store is
+		// first so that a slow write to the serial console cannot delay what a
+		// pull will find — the store is the copy that has to survive having
+		// been asleep at the console.
+		sinks := tee.TimingSinks{}
+		if metricsStore != nil {
+			sinks = append(sinks, metricsStore)
+		}
+		sinks = append(sinks, timingSink{log: logger.Logger})
+		reporter := tee.NewTimingReporter(level, sinks, *timingWindow)
+		go reporter.Run(context.Background())
+		timing = &tee.TimingConfig{Level: level, Sink: reporter, StallThreshold: *timingStall}
+		logger.Info("timing instrumentation on",
+			zap.String("level", level.String()),
+			zap.String("window", timingWindow.String()),
+			zap.String("stall_report", timingStall.String()))
+	} else if metricsStore != nil {
+		// A store nothing feeds serves an empty ring, which is indistinguishable
+		// from a quiet TEE unless this line says so.
+		log.Printf("metrics endpoint %s is on but instrumentation is off (TEE_TIMING): /timing will serve an empty ring", *metricsAddr)
 	}
 	// The certificate the Hub-facing listener presents, when it is mTLS: the
 	// platform's RA-TLS config plus the Hub client CA. It is assembled before the
@@ -242,6 +305,7 @@ func main() {
 		Seq:            store,
 		InboxKey:       inbox,
 		RequestTimeout: *requestTimeout,
+		Timing:         timing,
 	}
 	// svcRuntime holds the receipt signer, which is bound to the attested epoch
 	// key and is replaced whenever the platform rotates that key. The inbox key
@@ -306,6 +370,41 @@ func main() {
 		go runEpochRefresh(context.Background(), assembly.Refresher, svcRuntime, logger)
 	}
 
+	// The instrumentation endpoint, on its own listener and outside the mTLS
+	// one. It is read-only telemetry with no secret in it, so a scraper reaches
+	// it by being allowed through the network rather than by being handed a
+	// certificate — and keeping it off the request plane means nothing that
+	// reaches the Hub-facing port can read it, and a stuck puller cannot
+	// occupy a connection the Hub needs.
+	//
+	// A failure here is deliberately not fatal, unlike both listeners below:
+	// this endpoint is a diagnostic, and refusing to serve buyers because a
+	// diagnostic port is taken would be the wrong trade. It is not silent
+	// either — the line goes to the console, which is the channel that survives
+	// a broken log sink — because an endpoint that is quietly absent is the
+	// failure mode this whole feature exists to end.
+	if metricsStore != nil {
+		metricsMux := http.NewServeMux()
+		metrics.NewHTTPServer(metricsStore, metricsMux)
+		maddr := *metricsAddr
+		go func() {
+			log.Printf("metrics endpoint listening on http://%s/timing (%d records retained)", maddr, metricsStore.Retain())
+			srv := &http.Server{
+				Addr:              maddr,
+				Handler:           metricsMux,
+				ReadHeaderTimeout: 10 * time.Second,
+				// Same reason as the listeners below: the console is the last
+				// channel to survive a broken log sink, so nothing may consume
+				// it in bulk.
+				ErrorLog: log.New(newListenerLog(os.Stderr), "", log.LstdFlags),
+			}
+			if err := srv.ListenAndServe(); err != nil {
+				logger.Error("metrics endpoint stopped: " + err.Error())
+				log.Printf("metrics endpoint at %s stopped: %v", maddr, err)
+			}
+		}()
+	}
+
 	if *serveMTLS {
 		log.Printf("tee (platform=%s, includeEvidence=%t, mtls) listening on https://%s",
 			*platformName, *includeEvidence, *addr)
@@ -357,6 +456,48 @@ func relayHeaders(key string) http.Header {
 		return nil
 	}
 	return http.Header{hub.RelayKeyHeader: {key}}
+}
+
+// timingSink renders the TEE's instrumentation onto the structured logger.
+//
+// It is the process edge's half of the instrumentation: the service measures,
+// and this decides what a line looks like and where it goes. The fields
+// themselves come from the record (see TimingRecord.Flat), so a log line and a
+// metrics pull spell the same measurement the same way.
+//
+// Writing through the same logger the epoch publications use is what keeps the
+// durable channel available without a second implementation: it is the console
+// by default, and CloudWatch the moment the instance carries an instance
+// profile that can ship (shared/logger_cloudwatch_linux.go).
+type timingSink struct{ log *zap.Logger }
+
+// The service is handed this as a tee.TimingSink, so a drift in the interface
+// is a build failure rather than a line that quietly stops appearing.
+var _ tee.TimingSink = timingSink{}
+
+func (s timingSink) TimingRequest(rec tee.TimingRecord) {
+	fields := make([]zap.Field, 0, 16)
+	for _, f := range rec.Flat() {
+		// Any, not the typed constructors: the record already decided what
+		// each field is, and re-deciding it here is how the two renderings
+		// would drift apart.
+		fields = append(fields, zap.Any(f.Name, f.Value))
+	}
+	if rec.Outcome == tee.TimingRunning {
+		// Warn rather than Info, so a stalled request stands out in a stream
+		// that is otherwise all healthy ones.
+		s.log.Warn("tee.request.stalled", fields...)
+		return
+	}
+	s.log.Info("tee.request", fields...)
+}
+
+func (s timingSink) TimingAggregate(agg tee.TimingAggregate) {
+	fields := make([]zap.Field, 0, 16)
+	for _, f := range agg.Flat() {
+		fields = append(fields, zap.Any(f.Name, f.Value))
+	}
+	s.log.Info("tee.timing.summary", fields...)
 }
 
 // upstreamTLSConfig returns the TLS trust roots for provider connections.

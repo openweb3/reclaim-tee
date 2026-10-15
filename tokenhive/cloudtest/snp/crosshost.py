@@ -13,6 +13,8 @@ loader from EC2 user-data, so this script encodes it as KEY=VAL lines:
     TEE_PLATFORM=sevsnp               real attestation (fail-fast off SNP)
     TEE_MTLS=1                         RA-TLS + demand a Hub client cert
     TEE_MTLS_CLIENT_CA=/run/bundle/mtls/hub-ca.pem
+    TEE_METRICS_ADDR=0.0.0.0:18092     instrumentation an operator pulls
+    TEE_TIMING=<off|summary|full>      how much instrumentation there is
 
 The confidential instance also carries an IAM instance profile when
 TOKENHIVE_TEE_INSTANCE_PROFILE names one. That profile is what lets the TEE's
@@ -22,7 +24,8 @@ a few minutes deep. The profile is bound at RunInstances, so it is an input to
 launching rather than something a later call can add.
 
 Both instances share one VPC/subnet/SG. The SG additionally permits the
-cross-host ports (18085 hub relay, 18090 tee) between its own members
+cross-host ports (18085 hub relay, 18090 tee, 18092 tee metrics) between
+its own members
 (source = the SG itself), so they reach each other regardless of public IP.
 
     TOKENHIVE_TEE_INSTANCE_PROFILE=<name> \
@@ -89,7 +92,7 @@ HERE = Path(__file__).resolve().parent
 HOSTS_FILE = CLOUDTEST / "crosshost.json"
 KEY_FILE = CLOUDTEST / "ssh-key.pem"
 
-CROSS_PORTS = [18085, 18090]
+CROSS_PORTS = [18085, 18090, 18092]
 
 # The Hub's TeeRelay now requires the TEE to present a key, and the Hub refuses
 # to serve without it. crosshost.sh starts the Hub with this same default, so a
@@ -114,6 +117,22 @@ TEE_ONLY_RELAY_PLACEHOLDER = "ws://127.0.0.1:18085/v1/relay"
 # logs only. A name that does not exist needs no check here — RunInstances
 # rejects it outright, so there is no half-provisioned state to clean up.
 TEE_PROFILE_ENV = "TOKENHIVE_TEE_INSTANCE_PROFILE"
+
+# Instrumentation level for the tee, by env name (TEE_TIMING on the
+# instance). Empty means off, which is what a deployment wants when nobody
+# is asking the TEE where its time went: `full` costs a log line per
+# request, and the console those lines land on holds about 64 KiB, so it is
+# for a bounded run. `summary` emits one line per window and can be left on.
+# Whatever the level, the metrics endpoint below keeps the detail for a pull,
+# which is the channel that does not compete with the console.
+TEE_TIMING_ENV = "TOKENHIVE_TEE_TIMING"
+TEE_TIMING_LEVELS = ("off", "summary", "full")
+
+# Where the tee's instrumentation endpoint listens on the instance. It is on
+# its own listener, outside the mTLS request plane, and read-only: what it
+# serves is stage timings keyed by job ID, with no payload and no credential
+# in it. The SG rule above admits it to group members only.
+TEE_METRICS_ADDR = "0.0.0.0:18092"
 
 # The instance states a recorded instance may be ADOPTED in. Adoption is a
 # promise that the recorded machine can serve this run, so the only states that
@@ -365,6 +384,14 @@ def main() -> None:
     # Where the TEE's logs go on AWS. Read here rather than at the launch so the
     # reuse branch below can compare it against what the reused instance carries.
     tee_profile = os.environ.get(TEE_PROFILE_ENV, "").strip()
+    # Where the tee's instrumentation is pointed, read here rather than at the
+    # launch for the same reason as the profile: a typo should stop this script
+    # rather than reach an instance whose only channel is a crash line on the
+    # serial console.
+    timing = os.environ.get(TEE_TIMING_ENV, "").strip()
+    if timing and timing not in TEE_TIMING_LEVELS:
+        sys.exit(f"{TEE_TIMING_ENV}={timing!r} is not one of {', '.join(TEE_TIMING_LEVELS)}")
+    timing_line = f"TEE_TIMING={timing}\n" if timing else ""
     if single:
         relay_url = ""
         relay = ""
@@ -392,6 +419,11 @@ def main() -> None:
         # which is what a replacing trust store would do — the handshake would
         # die in certificate verification having sent only a ClientHello.
         "TEE_CA=/run/bundle/mtls/mp-ca.pem\n"
+        # The instrumentation endpoint is always on: it is read-only telemetry
+        # with no secret in it, its SG rule admits group members only, and a
+        # profiling run should not need a second deploy to reach it.
+        f"TEE_METRICS_ADDR={TEE_METRICS_ADDR}\n"
+        f"{timing_line}"
     )
     if single:
         userdata += f"TOKENHIVE_RELAY_KEY={relay_key}\n"
@@ -472,6 +504,10 @@ def main() -> None:
             "relay_url": relay_url,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
+        # Said here rather than before the launch because the address to pull
+        # from is the instance's, which does not exist yet at that point.
+        print(f"  -> instrumentation endpoint http://{tee['private_ip']}:18092/timing "
+              f"(level {timing or 'off'})")
         state["tee"] = tee
         save_state(state)
 
