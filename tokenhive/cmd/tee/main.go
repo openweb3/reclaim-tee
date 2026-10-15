@@ -206,18 +206,18 @@ func main() {
 		if !loggerAvailable {
 			log.Printf("timing level %s is on, but the structured logger is unavailable: no record will reach a log", level)
 		}
-		// Two destinations from one record, and the level decides what is
-		// produced rather than which destination gets it: an operator has one
-		// knob, and every channel sees what that knob asked for. The store is
-		// first so that a slow write to the serial console cannot delay what a
-		// pull will find — the store is the copy that has to survive having
-		// been asleep at the console.
+		// Two destinations from one record, and every record reaches both: the
+		// store is what an operator pulls and has to hold the detail at any
+		// level, while the log sink is where the level decides how much is
+		// written. The store is first so that a slow write to the serial
+		// console cannot delay what a pull will find — the store is the copy
+		// that has to survive having been asleep at the console.
 		sinks := tee.TimingSinks{}
 		if metricsStore != nil {
 			sinks = append(sinks, metricsStore)
 		}
-		sinks = append(sinks, timingSink{log: logger.Logger})
-		reporter := tee.NewTimingReporter(level, sinks, *timingWindow)
+		sinks = append(sinks, timingSink{log: logger.Logger, level: level})
+		reporter := tee.NewTimingReporter(sinks, *timingWindow)
 		go reporter.Run(context.Background())
 		timing = &tee.TimingConfig{Level: level, Sink: reporter, StallThreshold: *timingStall}
 		logger.Info("timing instrumentation on",
@@ -469,13 +469,25 @@ func relayHeaders(key string) http.Header {
 // durable channel available without a second implementation: it is the console
 // by default, and CloudWatch the moment the instance carries an instance
 // profile that can ship (shared/logger_cloudwatch_linux.go).
-type timingSink struct{ log *zap.Logger }
+// The level decides how much of it reaches a log, and nothing else: the store
+// beside this sink keeps every record either way, so asking for a quiet console
+// never empties what an operator can pull.
+type timingSink struct {
+	log   *zap.Logger
+	level tee.TimingLevel
+}
 
 // The service is handed this as a tee.TimingSink, so a drift in the interface
 // is a build failure rather than a line that quietly stops appearing.
 var _ tee.TimingSink = timingSink{}
 
 func (s timingSink) TimingRequest(rec tee.TimingRecord) {
+	// A stall is the line that says a request is *not* finishing, so it is
+	// written at every level; a request line is what full adds. Both are more
+	// than a console that holds 64 KiB can take, which is why the level exists.
+	if rec.Outcome != tee.TimingRunning && s.level != tee.TimingFull {
+		return
+	}
 	fields := make([]zap.Field, 0, 16)
 	for _, f := range rec.Flat() {
 		// Any, not the typed constructors: the record already decided what

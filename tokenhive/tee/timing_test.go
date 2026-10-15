@@ -256,29 +256,19 @@ func TestTimingsAreNilSafe(t *testing.T) {
 	}
 }
 
-// TestTimingReporterHonoursTheLevel pins the volume rule the console depends
-// on: full forwards every request line, summary forwards none of them, and
-// neither loses a stall — a stall is the one line that says a request is not
-// finishing, and it must not be silenced by a level setting.
-func TestTimingReporterHonoursTheLevel(t *testing.T) {
-	for _, tc := range []struct {
-		level     TimingLevel
-		wantLines int
-	}{
-		{TimingSummary, 0},
-		{TimingFull, 1},
-	} {
-		out := &recordingSink{}
-		reporter := NewTimingReporter(tc.level, out, time.Minute)
-		reporter.TimingRequest(TimingRecord{Outcome: TimingComplete, Stages: []TimingStage{{Name: StageTTFB, Dur: time.Second}}})
-		if got := len(out.records()); got != tc.wantLines {
-			t.Errorf("level %v forwarded %d request lines, want %d", tc.level, got, tc.wantLines)
-		}
+// TestTimingReporterForwardsEveryRecord pins the property the pull channel
+// depends on: a record reaches the sinks behind the reporter whatever the level
+// says. The level is about how much reaches a log, and a reporter that filtered
+// here would have emptied the store in the one mode a long-running deployment
+// uses.
+func TestTimingReporterForwardsEveryRecord(t *testing.T) {
+	out := &recordingSink{}
+	reporter := NewTimingReporter(out, time.Minute)
+	reporter.TimingRequest(TimingRecord{Outcome: TimingComplete, Stages: []TimingStage{{Name: StageTTFB, Dur: time.Second}}})
+	reporter.TimingRequest(TimingRecord{Outcome: TimingRunning, Stage: StageTLS, Waited: time.Minute})
 
-		reporter.TimingRequest(TimingRecord{Outcome: TimingRunning, Stage: StageTLS, Waited: time.Minute})
-		if got := len(out.records()); got != tc.wantLines+1 {
-			t.Errorf("level %v dropped a stall: %d lines, want %d", tc.level, got, tc.wantLines+1)
-		}
+	if got := len(out.records()); got != 2 {
+		t.Errorf("forwarded %d records, want both the finished request and the stall", got)
 	}
 }
 
@@ -288,7 +278,7 @@ func TestTimingReporterHonoursTheLevel(t *testing.T) {
 // window does not carry its samples into the next one.
 func TestTimingReporterSummarisesAWindow(t *testing.T) {
 	out := &recordingSink{}
-	reporter := NewTimingReporter(TimingSummary, out, time.Minute)
+	reporter := NewTimingReporter(out, time.Minute)
 
 	// Twenty records, one per millisecond of ttfb and read, so the percentiles
 	// are known by construction rather than by recomputing them here.
@@ -323,11 +313,11 @@ func TestTimingReporterSummarisesAWindow(t *testing.T) {
 	if ttfb.Samples != 20 || ttfb.P50 != 10*time.Millisecond || ttfb.P95 != 19*time.Millisecond {
 		t.Errorf("ttfb stat = %+v, want 20 samples, p50 10ms, p95 19ms (nearest rank of 1..20ms)", ttfb)
 	}
-	// Only the stall reached the sink at this level, and its cost is reported
-	// like any other name in the window: the aggregate has to say what the
-	// instrumentation itself cost.
-	if sink := statOf(t, agg, timingSinkStage); sink.Samples != 1 {
-		t.Errorf("sink samples = %d, want 1 (the one line this level forwarded)", sink.Samples)
+	// Every record reached the sink whatever the level says, and the sink's
+	// cost is reported like any other name in the window: the aggregate has to
+	// say what the instrumentation itself cost.
+	if sink := statOf(t, agg, timingSinkStage); sink.Samples != 22 {
+		t.Errorf("sink samples = %d, want 22 (every record forwarded)", sink.Samples)
 	}
 
 	// An idle window is silent, and the window after a flush starts empty: a
@@ -362,7 +352,7 @@ func (s *sleepySink) TimingRequest(rec TimingRecord) {
 // "this TEE is slow" from "this TEE's logging is slow".
 func TestTimingReporterMeasuresTheSinkCost(t *testing.T) {
 	out := &sleepySink{delay: 5 * time.Millisecond}
-	reporter := NewTimingReporter(TimingFull, out, time.Minute)
+	reporter := NewTimingReporter(out, time.Minute)
 	reporter.TimingRequest(TimingRecord{Outcome: TimingComplete, Stages: []TimingStage{{Name: StageTTFB, Dur: time.Second}}})
 	reporter.Flush()
 

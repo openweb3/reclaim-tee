@@ -703,15 +703,15 @@ func errString(err error) string {
 }
 
 // TimingReporter folds a stream of per-request records into a periodic summary
-// and forwards the records themselves only when the level asks for them.
+// and passes every record on to the sinks behind it.
 //
-// It is the sink the service is configured with, so the log volume a TEE
-// produces is decided in one place. It is also where the "one line per request"
-// rule is enforced rather than assumed: a sink downstream of this one never sees
-// a request line at summary level, so no later change to the sink can
-// accidentally flood the console.
+// It forwards everything rather than filtering, because what an operator can
+// pull and what a log receives are two different questions and the level answers
+// only the second: the sink that writes lines is where "one line per request, or
+// none" is enforced. Filtering here emptied the pullable store at exactly the
+// level a long-running deployment is told to run at, and a store nothing feeds
+// looks like a quiet TEE.
 type TimingReporter struct {
-	level  TimingLevel
 	out    TimingSink
 	window time.Duration
 
@@ -740,12 +740,11 @@ var timingAggregateOrder = slices.Concat(timingStageOrder, []string{timingSinkSt
 
 // NewTimingReporter wraps a sink with a periodic summary. A window of zero or
 // less means DefaultTimingWindow.
-func NewTimingReporter(level TimingLevel, out TimingSink, window time.Duration) *TimingReporter {
+func NewTimingReporter(out TimingSink, window time.Duration) *TimingReporter {
 	if window <= 0 {
 		window = DefaultTimingWindow
 	}
 	return &TimingReporter{
-		level:  level,
 		out:    out,
 		window: window,
 		stages: make(map[string][]time.Duration, len(timingStageOrder)),
@@ -754,24 +753,18 @@ func NewTimingReporter(level TimingLevel, out TimingSink, window time.Duration) 
 
 // TimingRequest implements TimingSink.
 func (r *TimingReporter) TimingRequest(rec TimingRecord) {
-	// A stall is not a request that finished: it is the one line saying a
-	// request is *not* finishing, so it is forwarded at every level. Losing it
-	// to a level setting would leave the condition it exists for dark, which is
-	// exactly the failure this instrumentation was written to end.
-	stalled := rec.Outcome == TimingRunning
-	if stalled || r.level == TimingFull {
-		// The sink's own cost is measured around the call rather than inside
-		// the service, because what it costs is a property of where the line
-		// goes: a CloudWatch shipper takes microseconds to queue it, the serial
-		// console takes as long as the write takes.
-		at := time.Now()
-		r.out.TimingRequest(rec)
-		// Folded in like any other sample, because that is what it is: what
-		// this record cost to deliver, as opposed to what the request cost to
-		// serve.
-		r.fold(timingSinkStage, time.Since(at))
-	}
-	if stalled {
+	// The sink's own cost is measured around the call rather than inside the
+	// service, because what it costs is a property of where the record goes: a
+	// store write is microseconds, a CloudWatch shipper queues it a little
+	// later, and the serial console takes as long as the write takes.
+	at := time.Now()
+	r.out.TimingRequest(rec)
+	// Folded in like any other sample, because that is what it is: what this
+	// record cost to deliver, as opposed to what the request cost to serve.
+	r.fold(timingSinkStage, time.Since(at))
+	// A stall is not a request that finished, so it contributes no sample to
+	// the window it arrives in.
+	if rec.Outcome == TimingRunning {
 		return
 	}
 

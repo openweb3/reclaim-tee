@@ -15,7 +15,7 @@ import (
 // newTimingTestSink returns a sink whose lines can be read back as JSON. The
 // fields are the contract a log query is written against, so they are asserted
 // rather than eyeballed.
-func newTimingTestSink(t *testing.T) (timingSink, *bytes.Buffer) {
+func newTimingTestSink(t *testing.T, level tee.TimingLevel) (timingSink, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
 	encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
@@ -25,7 +25,7 @@ func newTimingTestSink(t *testing.T) (timingSink, *bytes.Buffer) {
 		EncodeLevel: zapcore.LowercaseLevelEncoder,
 	})
 	logger := zap.New(zapcore.NewCore(encoder, zapcore.AddSync(&buf), zapcore.InfoLevel))
-	return timingSink{log: logger}, &buf
+	return timingSink{log: logger, level: level}, &buf
 }
 
 // decodeLine parses the single JSON line the sink wrote.
@@ -42,7 +42,7 @@ func decodeLine(t *testing.T, buf *bytes.Buffer) map[string]any {
 // greps these and a dashboard sums them, so a rename is a breaking change and
 // belongs in a test rather than in a changelog.
 func TestTimingSinkRendersARequest(t *testing.T) {
-	sink, buf := newTimingTestSink(t)
+	sink, buf := newTimingTestSink(t, tee.TimingFull)
 	sink.TimingRequest(tee.TimingRecord{
 		JobID:    "9f3a",
 		Provider: "openai",
@@ -101,7 +101,9 @@ func TestTimingSinkRendersARequest(t *testing.T) {
 // a request has not left, at warn level, with none of the stage fields a
 // finished request carries.
 func TestTimingSinkRendersAStall(t *testing.T) {
-	sink, buf := newTimingTestSink(t)
+	// Summary, deliberately: a stalled request is written at every level, and
+	// this is the test that would fail if that stopped being true.
+	sink, buf := newTimingTestSink(t, tee.TimingSummary)
 	sink.TimingRequest(tee.TimingRecord{
 		JobID:    "9f3a",
 		Provider: "openai",
@@ -130,11 +132,36 @@ func TestTimingSinkRendersAStall(t *testing.T) {
 	}
 }
 
+// TestTimingSinkHonoursTheLevel pins where the volume rule lives, now that the
+// reporter no longer filters: the level decides what reaches a log. A request
+// line is what full adds, a stall is written either way, and the answer has
+// nothing to do with the store an operator pulls from.
+func TestTimingSinkHonoursTheLevel(t *testing.T) {
+	request := tee.TimingRecord{Outcome: tee.TimingComplete, Stages: []tee.TimingStage{{Name: tee.StageTTFB, Dur: time.Second}}}
+	stall := tee.TimingRecord{Outcome: tee.TimingRunning, Stage: tee.StageTLS, Waited: time.Minute}
+
+	sink, buf := newTimingTestSink(t, tee.TimingSummary)
+	sink.TimingRequest(request)
+	if buf.Len() != 0 {
+		t.Errorf("summary wrote a request line: %q", buf.String())
+	}
+	sink.TimingRequest(stall)
+	if line := decodeLine(t, buf); line["message"] != "tee.request.stalled" {
+		t.Errorf("summary dropped a stall: %v", line)
+	}
+
+	sink, buf = newTimingTestSink(t, tee.TimingFull)
+	sink.TimingRequest(request)
+	if line := decodeLine(t, buf); line["message"] != "tee.request" {
+		t.Errorf("full wrote %v, want the request line the level adds", line)
+	}
+}
+
 // TestTimingSinkRendersASummary pins the aggregate's shape: counts, then one
 // p50/p95/sample triple per stage that had samples, and the instrumentation's
 // own cost last.
 func TestTimingSinkRendersASummary(t *testing.T) {
-	sink, buf := newTimingTestSink(t)
+	sink, buf := newTimingTestSink(t, tee.TimingSummary)
 	sink.TimingAggregate(tee.TimingAggregate{
 		Window:   30 * time.Second,
 		Requests: 12,
