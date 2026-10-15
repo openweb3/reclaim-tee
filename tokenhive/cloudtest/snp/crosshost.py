@@ -134,6 +134,16 @@ TEE_TIMING_LEVELS = ("off", "summary", "full")
 # in it. The SG rule above admits it to group members only.
 TEE_METRICS_ADDR = "0.0.0.0:18092"
 
+# How long one provider exchange may run, injected rather than left at the tee
+# binary's own 2m default. Two minutes is shorter than a real generation:
+# Claude Code asks for up to 64k output tokens and its own client waits ten
+# minutes, so a 2m exchange truncates the answer mid-stream and the buyer pays
+# for a reply that was cut off. It stays below Hive's 15-minute execution
+# budget on purpose — the tee has to be the side that gives up first. A cut the
+# tee makes leaves a truncated receipt the Hub can still bill; a cut the Hub
+# makes on a connection whose bytes already reached the buyer settles nothing.
+TEE_REQUEST_TIMEOUT = "14m"
+
 # The instance states a recorded instance may be ADOPTED in. Adoption is a
 # promise that the recorded machine can serve this run, so the only states that
 # qualify are the ones where it is on its way up or already up.
@@ -423,6 +433,7 @@ def main() -> None:
         # with no secret in it, its SG rule admits group members only, and a
         # profiling run should not need a second deploy to reach it.
         f"TEE_METRICS_ADDR={TEE_METRICS_ADDR}\n"
+        f"TEE_REQUEST_TIMEOUT={TEE_REQUEST_TIMEOUT}\n"
         f"{timing_line}"
     )
     if single:
@@ -508,6 +519,7 @@ def main() -> None:
         # from is the instance's, which does not exist yet at that point.
         print(f"  -> instrumentation endpoint http://{tee['private_ip']}:18092/timing "
               f"(level {timing or 'off'})")
+        print(f"  -> one provider exchange may run {TEE_REQUEST_TIMEOUT}")
         state["tee"] = tee
         save_state(state)
 
