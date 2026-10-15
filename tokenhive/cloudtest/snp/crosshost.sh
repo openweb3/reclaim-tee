@@ -400,7 +400,17 @@ sleep 1
 # (-evidence=false) verifiable here: Hub and TEE are on different machines, so
 # the TEE's evidence store is never on this host. Harmless when the TEE embeds
 # evidence inline (the fetch is never reached), essential the moment it does not.
+# Both of the Hub's own bounds have to stay above the tee's exchange bound,
+# which is the TEE_REQUEST_TIMEOUT crosshost.py spends: whoever gives up first is
+# whoever decides whether the work settles. A cut the tee makes leaves a
+# truncated receipt the Hub can still bill by delivered volume; a cut the Hub
+# makes drops a connection whose bytes already reached the buyer, and that
+# settles nothing. The defaults (3m an attempt, 10m a streaming session) are both
+# below the tee's 14m, so the pair is written down here: the tee's bound covers a
+# streaming session too, which is why the session bound is named as well.
 ./tee/hub -serve 0.0.0.0:18085 -agent-keys 'openai-sim=${agent_key}' -relay-key '${relay_key}' \
+  -attempt-timeout 15m \
+  -session-timeout 15m \
   -policy-dir "\$HOME/${REMOTE_POLICY_REL}" \
   -host 127.0.0.1:18080 \
   -model sim-mock-0.5b -tee https://${tip}:18090 -tee-verify attestation \
