@@ -63,6 +63,30 @@ var AllowedResponseHeaders = map[string]struct{}{
 	"anthropic-ratelimit-output-tokens-limit":     {},
 	"anthropic-ratelimit-output-tokens-remaining": {},
 	"anthropic-ratelimit-output-tokens-reset":     {},
+	// The ChatGPT subscription endpoint's request IDs, the ones its operators
+	// ask for: x-request-id is not what chatgpt.com sends.
+	"x-oai-request-id": {},
+	"cf-ray":           {},
+	// What the Codex client reads off a subscription response, so a buyer's
+	// Codex behaves as it does signed in to the subscription. The quota and
+	// credit headers that endpoint also sends describe the seller's account,
+	// not the buyer's, and stay inside the TEE.
+	//
+	// x-codex-turn-state is a sticky-routing token Codex echoes on the next
+	// request of the turn.
+	"x-codex-turn-state": {},
+	// x-models-etag tells Codex its model catalog changed and to refresh it.
+	"x-models-etag": {},
+	// x-reasoning-included says the response already counts reasoning, which
+	// Codex uses to account its context and decide when to compact.
+	"x-reasoning-included": {},
+	// openai-model names the model that actually served the request, so Codex
+	// can warn when it differs from the one asked for.
+	"openai-model": {},
+	// The safety-buffering pair tells Codex the response is being held back
+	// for review, and which faster model it may suggest instead.
+	"x-codex-safety-buffering-enabled":      {},
+	"x-codex-safety-buffering-faster-model": {},
 }
 
 // ForwardResponseHeaders filters a transport's full upstream header set down

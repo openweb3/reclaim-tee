@@ -3,7 +3,9 @@ package policy
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"testing"
+	"time"
 )
 
 // TestDefaultWhitelistIsTheDocument pins that the shipped whitelist is the file
@@ -126,5 +128,41 @@ func TestDefaultWhitelistIsReproducible(t *testing.T) {
 	}
 	if firstHash != secondHash {
 		t.Fatalf("the shipped whitelist is not reproducible: %x vs %x", firstHash, secondHash)
+	}
+}
+
+// TestDefaultWhitelistAdmitsTheCodexModelCatalog pins the one GET the
+// subscription endpoint answers outside inference: the model catalog for a
+// Codex release, asked for by client_version and nothing else.
+func TestDefaultWhitelistAdmitsTheCodexModelCatalog(t *testing.T) {
+	p, err := Default()
+	if err != nil {
+		t.Fatalf("Default: %v", err)
+	}
+	now := time.Now()
+	spec := jobs.Spec{
+		Version:          jobs.VersionV1,
+		JobID:            make([]byte, jobs.JobIDLength),
+		Provider:         "openai",
+		Method:           "GET",
+		Host:             "chatgpt.com:443",
+		Path:             "/backend-api/codex/models",
+		Query:            "client_version=0.163.0",
+		Headers:          map[string]string{"accept": "application/json", "chatgpt-account-id": "account", "originator": "codex_cli_rs", "user-agent": "codex_cli_rs/0.163.0"},
+		BodyHash:         bodyHash(""),
+		Nonce:            make([]byte, jobs.MinNonceLength),
+		ExpiresAt:        now.Unix() + 60,
+		MaxResponseBytes: 1 << 20,
+	}
+	if _, err := p.AuthorizeAt(spec, now); err != nil {
+		t.Fatalf("the Codex model catalog was refused: %v", err)
+	}
+	spec.Query = "client_version=0.163.0&limit=1"
+	if _, err := p.AuthorizeAt(spec, now); err == nil {
+		t.Fatal("a catalog query with an unlisted key was admitted")
+	}
+	spec.Query, spec.Stream = "client_version=0.163.0", true
+	if _, err := p.AuthorizeAt(spec, now); err == nil {
+		t.Fatal("the catalog was admitted as a stream")
 	}
 }
