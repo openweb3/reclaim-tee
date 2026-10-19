@@ -32,6 +32,11 @@
     },
     {
       "methods": ["GET"],
+      "path": "/backend-api/codex/models",
+      "query_keys": ["client_version"]
+    },
+    {
+      "methods": ["GET"],
       "path": "/v1/realtime",
       "allow_stream": true,
       "allow_any_query": true
@@ -50,6 +55,14 @@
       "version",
       "session-id",
       "thread-id",
+      "x-openai-internal-codex-responses-lite",
+      "x-codex-beta-features",
+      "x-codex-turn-state",
+      "x-codex-turn-metadata",
+      "x-codex-window-id",
+      "x-codex-parent-thread-id",
+      "x-openai-subagent",
+      "x-codex-routing-hint",
       "anthropic-version",
       "anthropic-beta",
       "anthropic-dangerous-direct-browser-access",

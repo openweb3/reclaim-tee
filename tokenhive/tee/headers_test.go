@@ -93,3 +93,33 @@ func TestAllowedResponseHeadersListIsCompleteAndNormalised(t *testing.T) {
 		}
 	}
 }
+
+// TestForwardResponseHeadersCarriesWhatCodexReads pins that a buyer's Codex
+// gets the headers it acts on from a subscription response, and that the
+// seller's quota and credit headers on the same response stay behind.
+func TestForwardResponseHeadersCarriesWhatCodexReads(t *testing.T) {
+	src := map[string][]string{
+		"X-Codex-Turn-State":                    {"sticky"},
+		"X-Models-Etag":                         {"W/\"e0\""},
+		"X-Reasoning-Included":                  {"true"},
+		"Openai-Model":                          {"gpt-6.1-sol"},
+		"X-Codex-Safety-Buffering-Enabled":      {"true"},
+		"X-Codex-Safety-Buffering-Faster-Model": {"gpt-6-luna"},
+		"X-Oai-Request-Id":                      {"req_1"},
+		"Cf-Ray":                                {"8f-SJC"},
+		"X-Codex-Primary-Used-Percent":          {"42"},
+		"X-Codex-Credits-Balance":               {"10"},
+		"X-Codex-Active-Limit":                  {"codex"},
+	}
+	got := ForwardResponseHeaders(src)
+	for _, kept := range []string{"X-Codex-Turn-State", "X-Models-Etag", "X-Reasoning-Included", "Openai-Model", "X-Codex-Safety-Buffering-Enabled", "X-Codex-Safety-Buffering-Faster-Model", "X-Oai-Request-Id", "Cf-Ray"} {
+		if len(got[kept]) != 1 || got[kept][0] != src[kept][0] {
+			t.Errorf("%s = %v, want %v", kept, got[kept], src[kept])
+		}
+	}
+	for _, dropped := range []string{"X-Codex-Primary-Used-Percent", "X-Codex-Credits-Balance", "X-Codex-Active-Limit"} {
+		if _, ok := got[dropped]; ok {
+			t.Errorf("%s describes the seller's account and crossed the seam", dropped)
+		}
+	}
+}

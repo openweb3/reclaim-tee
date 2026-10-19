@@ -55,7 +55,8 @@ var defaultWhitelist []byte
 // and the mock host the simulation runs every shape behind. Its paths mirror
 // the Hub's user-facing routes: the OpenAI chat completions endpoint, the
 // OpenAI Responses endpoint, the Anthropic messages endpoint, the ChatGPT
-// subscription endpoint, and the streaming-session endpoint. In a real
+// subscription endpoint and the Codex model catalog beside it, and the
+// streaming-session endpoint. In a real
 // deployment those live on api.openai.com, api.anthropic.com and chatgpt.com;
 // the simulation serves every shape from one mock host, so one whitelist covers
 // them all.
