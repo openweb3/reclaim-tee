@@ -4,6 +4,7 @@ package shared
 
 import (
 	"context"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -116,8 +117,14 @@ func addFieldToPayload(payload map[string]any, field zap.Field) {
 		payload[field.Key] = field.Integer
 	case zapcore.Uint64Type, zapcore.Uint32Type, zapcore.Uint16Type, zapcore.Uint8Type:
 		payload[field.Key] = field.Integer
-	case zapcore.Float64Type, zapcore.Float32Type:
-		payload[field.Key] = field.Integer // zap stores floats as int64
+	case zapcore.Float64Type:
+		// zap keeps a float field as its IEEE-754 bits, so this is a decode and
+		// not a cast: handing Integer through puts 4645666129713923682 where a
+		// latency of 0.4 was meant, and a number that is wrong but still reads
+		// as a number is the kind of wrong nobody catches in a log query.
+		payload[field.Key] = math.Float64frombits(uint64(field.Integer))
+	case zapcore.Float32Type:
+		payload[field.Key] = math.Float32frombits(uint32(field.Integer))
 	case zapcore.BoolType:
 		payload[field.Key] = field.Integer != 0
 	case zapcore.ErrorType:

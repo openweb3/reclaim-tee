@@ -188,7 +188,13 @@ func (p *channelPool) close() {
 //
 // The returned status is meaningful even when err is non-nil: a request that
 // reached the provider has a status to attest even if the body never finished.
+//
+// Its three stages are marked on the record carried by ctx: the write, the wait
+// for the response headers, and the body relay. The wait is the one that
+// dominates a real request, and it is entirely the provider's and the relay
+// chain's — nothing in this function is waiting on itself.
 func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([]byte) error, bufSize int, onStart []tee.StartFunc) (keep bool, status tee.Response, err error) {
+	tm := tee.TimingsFrom(ctx)
 	ch.wrote = 0
 
 	requestBytes, err := buildRequestBytes(req)
@@ -225,6 +231,7 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 		}
 	}()
 
+	tm.Mark(tee.StageWrite)
 	n, werr := ch.conn.Write(requestBytes)
 	ch.wrote = n
 	if werr != nil {
@@ -234,6 +241,7 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 		return false, tee.Response{}, io.ErrShortWrite
 	}
 
+	tm.Mark(tee.StageTTFB)
 	// ReadResponse consumes framing from the persistent buffered reader so a
 	// Content-Length or chunked body is understood even though we wrote the
 	// request bytes ourselves.
@@ -242,6 +250,12 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 		return false, tee.Response{}, fmt.Errorf("read response headers: %w", err)
 	}
 	status = tee.Response{StatusCode: uint32(resp.StatusCode), Headers: resp.Header}
+
+	// The body stage opens before the response start is reported, so ttfb ends
+	// exactly where the headers were parsed. That leaves the start frame — which
+	// the caller writes and flushes, and which can block on a caller that is not
+	// reading — charged to the relay rather than to the provider's thinking time.
+	tm.Mark(tee.StageBody)
 
 	// The response start is reported the moment the headers are parsed, before
 	// a single body byte moves: the caller must be able to commit its own
