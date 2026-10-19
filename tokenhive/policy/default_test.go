@@ -166,3 +166,35 @@ func TestDefaultWhitelistAdmitsTheCodexModelCatalog(t *testing.T) {
 		t.Fatal("the catalog was admitted as a stream")
 	}
 }
+
+// TestDefaultWhitelistAdmitsCompressedBodiesAndTokenCounts pins two shapes the
+// market relies on. A compressed body: the TEE sends a job's body byte for
+// byte and the receipt hashes those bytes, so a body the Hub compressed needs
+// only its Content-Encoding admitted. And Anthropic's count_tokens: rule paths
+// match by segment prefix, so the /v1/messages rule already covers
+// /v1/messages/count_tokens, and nothing else would announce it stopped doing
+// so.
+func TestDefaultWhitelistAdmitsCompressedBodiesAndTokenCounts(t *testing.T) {
+	p, err := Default()
+	if err != nil {
+		t.Fatalf("Default: %v", err)
+	}
+	now := time.Now()
+	spec := func(host, path, query string, headers map[string]string) jobs.Spec {
+		return jobs.Spec{
+			Version: jobs.VersionV1, JobID: make([]byte, jobs.JobIDLength), Provider: "provider",
+			Method: "POST", Host: host, Path: path, Query: query, Headers: headers,
+			BodyHash: bodyHash(`compressed`), Nonce: make([]byte, jobs.MinNonceLength),
+			ExpiresAt: now.Unix() + 60, MaxResponseBytes: 1 << 20, Stream: true,
+		}
+	}
+	codex := spec("chatgpt.com:443", "/backend-api/codex/responses", "", map[string]string{"content-type": "application/json", "content-encoding": "zstd", "accept": "text/event-stream"})
+	if _, err := p.AuthorizeAt(codex, now); err != nil {
+		t.Fatalf("a zstd-compressed Codex request was refused: %v", err)
+	}
+	count := spec("api.anthropic.com:443", "/v1/messages/count_tokens", "beta=true", map[string]string{"content-type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"})
+	count.Stream = false
+	if _, err := p.AuthorizeAt(count, now); err != nil {
+		t.Fatalf("Anthropic count_tokens was refused: %v", err)
+	}
+}
