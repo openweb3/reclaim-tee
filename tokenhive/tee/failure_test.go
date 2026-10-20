@@ -81,6 +81,15 @@ func TestClassifyFailure(t *testing.T) {
 			want:   &Failure{Class: FailureCallerGone, Stage: StageTTFB, Cold: true},
 		},
 		{
+			// A cancellation reaches whatever the exchange was doing. A dial
+			// that never returned reports the same context error a stall does,
+			// and it is still the caller who ended it.
+			name:   "the caller cancelled a dial",
+			err:    at(StageDial, true, context.Canceled),
+			ctxErr: context.Canceled,
+			want:   &Failure{Class: FailureCallerGone, Stage: StageDial, Cold: true},
+		},
+		{
 			name: "the upstream hung up before its status line",
 			err:  at(StageTTFB, true, io.EOF),
 			want: &Failure{Class: FailureUpstreamClosed, Stage: StageTTFB, Cold: true},

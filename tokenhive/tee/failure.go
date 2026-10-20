@@ -162,13 +162,18 @@ func (f Failure) String() string {
 //  1. What the relay raised beats what the transport returned: if the caller
 //     stopped taking bytes, the transport's "i/o timeout" describes the
 //     consequence, not the cause.
-//  2. Stage before deadline. A dial that timed out is a tunnel that never
+//  2. A cancelled exchange beats every stage. Cancelling is the caller's act
+//     and it reaches whatever the exchange was doing — a dial that had not
+//     returned yet reports the same context error a stall does. Placing it
+//     after the stage checks would hand the provider a failure the caller
+//     caused, which is the mistake this whole path exists to stop making.
+//  3. Stage before deadline. A dial that timed out is a tunnel that never
 //     opened, and calling it request_timeout would point an operator at the
 //     TEE's timeout configuration instead of at the thing that never answered.
-//  3. Deadline before read timeout, for the same reason in the other
+//  4. Deadline before read timeout, for the same reason in the other
 //     direction: the exchange's own bound is a fact about this deployment,
 //     while "a read timed out" is a fact about the wire.
-//  4. Anything left at a wire stage is a connection that ended early. That is
+//  5. Anything left at a wire stage is a connection that ended early. That is
 //     the only way an exchange gets that far and returns an error that is not
 //     a timeout, so it needs no error-type matching — which matters, because
 //     a relayed stream reports a deadline as io.EOF, not as a net.Error.
@@ -187,14 +192,14 @@ func ClassifyFailure(err, stopErr, contextErr error) *Failure {
 		failure.Class = FailureResponseTooLarge
 	case stopErr != nil:
 		failure.Class = FailureCallerGone
+	case errors.Is(contextErr, context.Canceled):
+		failure.Class = FailureCallerGone
 	case failure.Stage == StageDial:
 		failure.Class = FailureDial
 	case failure.Stage == StageTLS:
 		failure.Class = FailureTLSHandshake
 	case errors.Is(err, ErrRequestTimeout):
 		failure.Class = FailureRequestTimeout
-	case errors.Is(contextErr, context.Canceled):
-		failure.Class = FailureCallerGone
 	case isTimeout(err):
 		failure.Class = FailureReadTimeout
 	case failure.Stage == StageWrite, failure.Stage == StageTTFB, failure.Stage == StageBody:
