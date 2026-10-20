@@ -376,6 +376,14 @@ if grep -E "^\[receipt\].*completion=truncated" "$SIM/hub-big.log"; then
 else
   echo "      !! FAIL: expected completion=truncated"
 fi
+# The cap that stopped it is the Hub's own, and the TEE now says so on the
+# wire. Without the reason the Hub could only report a truncated stream, which
+# is also what a provider that died mid-response produces.
+if grep -Fq "failure=response_too_large" "$SIM/hub-big.log"; then
+  echo "      OK: the truncation is attributed to the cap, not to the provider"
+else
+  echo "      !! FAIL: expected the failure class response_too_large"
+fi
 if grep -Fqa "different bytes" "$SIM/hub-big.log"; then
   echo "      !! FAIL: Hub could not reconcile the attested stream (hash mismatch)"
 fi
