@@ -47,6 +47,7 @@
     "max_body_bytes": 8388608,
     "allowed_headers": [
       "content-type",
+      "content-encoding",
       "accept",
       "user-agent",
       "x-client-request-id",

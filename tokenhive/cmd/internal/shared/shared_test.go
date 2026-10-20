@@ -145,6 +145,8 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		{"chatgpt.com", "/backend-api/codex/responses", "POST"},
 		// The Codex model catalog the market serves its buyers' Codex.
 		{"chatgpt.com", "/backend-api/codex/models", "GET"},
+		// Anthropic's token count, under the /v1/messages rule.
+		{"api.anthropic.com", "/v1/messages/count_tokens", "POST"},
 	} {
 		if err := p.AllowsRoute(r.host, r.path, r.method); err != nil {
 			t.Errorf("%s %s%s not admitted by the default policy: %v", r.method, r.host, r.path, err)
@@ -158,7 +160,9 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 	}
 	for _, header := range []string{"content-type", "chatgpt-account-id", "originator", "session-id", "anthropic-version", "anthropic-beta", "x-claude-code-session-id", "x-stainless-helper-method",
 		// What the Codex client sends a subscription on every request.
-		"x-openai-internal-codex-responses-lite", "x-codex-beta-features", "x-codex-turn-state", "x-codex-turn-metadata", "x-codex-window-id", "x-codex-parent-thread-id", "x-openai-subagent", "x-codex-routing-hint"} {
+		"x-openai-internal-codex-responses-lite", "x-codex-beta-features", "x-codex-turn-state", "x-codex-turn-metadata", "x-codex-window-id", "x-codex-parent-thread-id", "x-openai-subagent", "x-codex-routing-hint",
+		// A request body the market compressed.
+		"content-encoding"} {
 		if !p.Limits.HeaderAllowed(header) {
 			t.Errorf("header %q is not allowed", header)
 		}
