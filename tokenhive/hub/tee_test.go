@@ -429,8 +429,12 @@ func TestCredentialKeyRetriesARetiredConnectionOnce(t *testing.T) {
 // when the stream ends without a receipt — which is the case a Hub most needs
 // it in, since that is the exchange it can neither settle nor explain.
 func TestReadSSECarriesTheTEEsAccountOfAFailure(t *testing.T) {
+	// One response chunk and one diagnostic frame. The chunk is what the
+	// receipt hashes; the frame must not become a second one, or every receipt
+	// for a failed exchange would fail its stream check.
 	stream := "event: failure\n" +
-		`data: {"class":"request_timeout","stage":"body","cold":true}` + "\n\n"
+		`data: {"class":"request_timeout","stage":"body","cold":true}` + "\n\n" +
+		"data: payload\n\n"
 	result, err := readSSE(strings.NewReader(stream), nil)
 	if !errors.Is(err, ErrNoReceipt) {
 		t.Fatalf("error = %v, want ErrNoReceipt: there was no receipt frame", err)
@@ -444,6 +448,9 @@ func TestReadSSECarriesTheTEEsAccountOfAFailure(t *testing.T) {
 	}
 	if detail := result.Failure.String(); detail != "request_timeout (cold, stage=body)" {
 		t.Errorf("detail = %q", detail)
+	}
+	if len(result.Chunks) != 1 || string(result.Chunks[0]) != "payload" {
+		t.Errorf("chunks = %q, want exactly the response payload", result.Chunks)
 	}
 }
 
