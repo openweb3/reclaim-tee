@@ -31,16 +31,24 @@ Hub 于是只能从回执的形状反推：没有状态码就是"上游连接失
 
 | `class` | 条件 |
 | --- | --- |
-| `request_timeout` | `Request.Timeout` 到期，且已经在对上游做读写 |
+| `request_timeout` | `Request.Timeout` 到期（拨号阶段除外，那算 `dial_failed`） |
 | `caller_gone` | 向 Hub 写 chunk 失败，或交换的 context 被取消 |
 | `response_too_large` | `ErrResponseBodyTooLarge` |
 | `dial_failed` | 到 Provider 的流没建立起来，含拨号阶段超时 |
-| `tls_handshake_failed` | 到上游的 TLS 握手出错 |
+| `tls_handshake_failed` | 到上游的 TLS 握手被拒（证书、信任库）；握手只是超时的算 `request_timeout` |
 | `upstream_closed` | 状态行之前或正文中途连接结束 |
 | `read_timeout` | 读超时，且不是 `Request.Timeout` 造成的 |
 | `other` | 以上都不是 |
 
-判断顺序是有讲究的，因为几种条件会同时成立：relay 抛出的错优先于 transport 返回的错（买家先走，transport 的 `i/o timeout` 描述的是后果）；取消优先于阶段（取消是调用方的动作，会落在当时正在做的任何事上，包括还没返回的拨号）；阶段优先于超时（拨号超时的原因是隧道没接上，不是 TEE 等太久）；`Request.Timeout` 优先于普通读超时。剩下的、停在写/等头/读正文三个阶段的错误，一定是连接提前结束，不需要再按错误类型匹配，因为中继流的 deadline 是以 `io.EOF` 的形式报出来的。
+判断顺序是有讲究的，因为几种条件会同时成立：
+
+relay 抛出的错优先于 transport 返回的错。买家先走，transport 的 `i/o timeout` 描述的是后果，不是原因。
+
+调用方结束的交换优先于阶段判定。取消是调用方的动作，会落在当时正在做的任何事上，包括还没返回的拨号；调用方自己设的 deadline 到期同理。transport 只给自己的 `Request.Timeout` 打 `ErrRequestTimeout` 标，所以 context 到期却没带标记，就是调用方的 bound。
+
+阶段优先于超时，但有一个例外。拨号超时说明隧道根本没打开，所以留在 `dial_failed`；TLS 握手超时不是握手被拒，它跟证书、信任库无关，所以不能留在 `tls_handshake_failed`：那是没等到答案，不是被拒绝。
+
+`Request.Timeout` 优先于普通读超时。剩下的、停在写/等头/读正文三个阶段的错误，一定是连接提前结束，不需要再按错误类型匹配，因为中继流的 deadline 是以 `io.EOF` 的形式报出来的。
 
 `Request.Timeout` 到期这件事，还要按**时钟**判一次而不只看 context：连接超时和 context 超时是对同一时刻的两个定时器，socket 可能先报出超时、context 的 goroutine 还没醒。只看 `ctx.Err()` 会把这一微秒判成"上游断了"，正好是本节的初衷要消灭的错判。
 
@@ -79,7 +87,7 @@ Hub 于是只能从回执的形状反推：没有状态码就是"上游连接失
 | `upstream_closed` | 上游或线路 | 是。注意 Hub 自己知道当时有没有接上 Agent，接不上时它也会关流 |
 | `read_timeout` | 上游慢或线路卡住 | 是 |
 | `other` | 无法归类，保持现状 | 保持现状 |
-| 不认识的 `class` | 更新的 TEE 发明的 | 按 `other` 处理，绝不当成"供给方有错" |
+| 不认识的 `class` | 更新的 TEE 发明的 | 按 `other` 处理，绝不当成"供给方有错"。Hub 的客户端在解析处就折叠成 `other`（`FailureClass.Known`），不把无法解释的 token 往下传 |
 
 `failure_detail` 用 `Failure.String()` 的形式：`completion failed: dial_failed (cold, stage=dial)`。
 

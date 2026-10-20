@@ -38,8 +38,9 @@ const (
 	FailureRequestTimeout FailureClass = "request_timeout"
 
 	// FailureCallerGone is the caller leaving: writing a chunk to it failed,
-	// or the exchange's context was cancelled. The Hub hung up, or the buyer
-	// did and the Hub cut the request with it.
+	// the exchange's context was cancelled, or a deadline the caller imposed
+	// expired. The Hub hung up, the buyer did and the Hub cut the request with
+	// it, or the caller's own budget ran out.
 	//
 	// A cancellation the TEE raises itself, the exchange-budget stop-loss in
 	// Execute, lands here too. It is not the caller's doing, but it is the same
@@ -65,6 +66,9 @@ const (
 	// terminates inside the TEE over a stream that is already open, so it is
 	// either the upstream's certificate or this enclave's trust store — never
 	// the bytes of a request.
+	//
+	// A handshake that merely ran out of the exchange's time is not this: see
+	// FailureRequestTimeout.
 	FailureTLSHandshake FailureClass = "tls_handshake_failed"
 
 	// FailureUpstreamClosed is the connection ending with no status line at
@@ -90,6 +94,21 @@ const (
 	// unrecognised class must never be read as "the provider did it".
 	FailureOther FailureClass = "other"
 )
+
+// Known reports whether this is a class the package defines. A reader uses it
+// to tell its own vocabulary from one a newer TEE invented, and to fold the
+// latter into FailureOther before anything acts on it: an unrecognised class
+// has no meaning here, and letting the token through is how "unknown" becomes
+// "the provider did it".
+func (c FailureClass) Known() bool {
+	switch c {
+	case FailureRequestTimeout, FailureCallerGone, FailureResponseTooLarge,
+		FailureDial, FailureTLSHandshake, FailureUpstreamClosed,
+		FailureReadTimeout, FailureOther:
+		return true
+	}
+	return false
+}
 
 // Failure is why an exchange did not complete, as the TEE observed it.
 //
@@ -155,14 +174,17 @@ func (f Failure) String() string {
 //  1. What the relay raised beats what the transport returned: if the caller
 //     stopped taking bytes, the transport's "i/o timeout" describes the
 //     consequence, not the cause.
-//  2. A cancelled exchange beats every stage. Cancelling is the caller's act
+//  2. An exchange the caller ended beats every stage: cancelled, or bounded by
+//     a deadline this deployment did not set. Cancelling is the caller's act
 //     and it reaches whatever the exchange was doing — a dial that had not
 //     returned yet reports the same context error a stall does. Placing it
 //     after the stage checks would hand the provider a failure the caller
 //     caused, which is the mistake this whole path exists to stop making.
-//  3. Stage before deadline. A dial that timed out is a tunnel that never
-//     opened, and calling it request_timeout would point an operator at the
-//     TEE's timeout configuration instead of at the thing that never answered.
+//  3. Stage before deadline, with one exception. A dial that timed out is a
+//     tunnel that never opened, so it stays dial_failed. A TLS handshake that
+//     timed out is not a rejected handshake, so it does not stay
+//     tls_handshake_failed: the stage describes where the request was, and a
+//     timeout there says the answer never came.
 //  4. Deadline before read timeout, for the same reason in the other
 //     direction: the exchange's own bound is a fact about this deployment,
 //     while "a read timed out" is a fact about the wire.
@@ -187,9 +209,18 @@ func ClassifyFailure(err, stopErr, contextErr error) *Failure {
 		failure.Class = FailureCallerGone
 	case errors.Is(contextErr, context.Canceled):
 		failure.Class = FailureCallerGone
+	case errors.Is(contextErr, context.DeadlineExceeded) && !errors.Is(err, ErrRequestTimeout):
+		// An expired deadline this deployment did not set. The transport tags
+		// its own bound with ErrRequestTimeout, so an untagged expiry is the
+		// caller's: the exchange was ended on the caller's side, exactly like a
+		// cancellation.
+		failure.Class = FailureCallerGone
 	case failure.Stage == StageDial:
 		failure.Class = FailureDial
-	case failure.Stage == StageTLS:
+	case failure.Stage == StageTLS && !errors.Is(err, ErrRequestTimeout):
+		// A handshake that ran out of the exchange's time is a timeout, not a
+		// certificate problem: nothing was rejected, the answer never came, and
+		// sending an operator to the trust store would be the wrong errand.
 		failure.Class = FailureTLSHandshake
 	case errors.Is(err, ErrRequestTimeout):
 		failure.Class = FailureRequestTimeout

@@ -44,9 +44,16 @@ func TestClassifyFailure(t *testing.T) {
 			want: &Failure{Class: FailureDial, Stage: StageDial, Cold: true},
 		},
 		{
-			name: "the handshake never finished",
+			name: "the handshake was rejected",
 			err:  at(StageTLS, true, errors.New("x509: certificate signed by unknown authority")),
 			want: &Failure{Class: FailureTLSHandshake, Stage: StageTLS, Cold: true},
+		},
+		{
+			// Nothing was rejected; the answer never came. Sending an operator
+			// to the trust store for this would be the wrong errand.
+			name: "the handshake ran out of the exchange's time",
+			err:  timeout(at(StageTLS, true, readDeadline)),
+			want: &Failure{Class: FailureRequestTimeout, Stage: StageTLS, Cold: true},
 		},
 		{
 			name: "the TEE's own bound expired",
@@ -88,6 +95,15 @@ func TestClassifyFailure(t *testing.T) {
 			err:    at(StageDial, true, context.Canceled),
 			ctxErr: context.Canceled,
 			want:   &Failure{Class: FailureCallerGone, Stage: StageDial, Cold: true},
+		},
+		{
+			// An untagged deadline expiry is one this deployment did not set:
+			// the transport tags its own bound, so this one is the caller's and
+			// must not become request_timeout.
+			name:   "the caller's own deadline expired",
+			err:    at(StageTTFB, true, readDeadline),
+			ctxErr: context.DeadlineExceeded,
+			want:   &Failure{Class: FailureCallerGone, Stage: StageTTFB, Cold: true},
 		},
 		{
 			name: "the upstream hung up before its status line",
@@ -150,5 +166,27 @@ func TestFailureRendersTheWayAnOperatorReadsIt(t *testing.T) {
 		if got := tc.failure.String(); got != tc.want {
 			t.Errorf("Failure.String() = %q, want %q", got, tc.want)
 		}
+	}
+}
+
+// TestEveryClassIsKnown pins the set Known reports against the classes this
+// package actually emits. A class missing from it would be folded into "other"
+// by every Hub at the boundary — silently, and exactly when it is the only
+// thing that would have explained a failure.
+func TestEveryClassIsKnown(t *testing.T) {
+	for _, class := range []FailureClass{
+		FailureRequestTimeout, FailureCallerGone, FailureResponseTooLarge,
+		FailureDial, FailureTLSHandshake, FailureUpstreamClosed,
+		FailureReadTimeout, FailureOther,
+	} {
+		if !class.Known() {
+			t.Errorf("%q is not Known", class)
+		}
+	}
+	if FailureClass("invented_by_a_newer_tee").Known() {
+		t.Error("an unknown class reports Known; every Hub would then act on a token it cannot interpret")
+	}
+	if FailureClass("").Known() {
+		t.Error("the empty class reports Known")
 	}
 }

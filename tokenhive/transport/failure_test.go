@@ -34,14 +34,12 @@ func stageOf(t *testing.T, err error) *tee.StageError {
 // paid for a connection.
 func TestDoNamesTheStageAFailureHappenedIn(t *testing.T) {
 	t.Run("dial", func(t *testing.T) {
-		// A port nothing listens on: the dial fails before a stream exists.
-		gone := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-		host := hostOf(gone)
-		gone.Close()
-
+		// Port 1 on loopback: nothing may listen there without root, and the
+		// ephemeral range httptest draws from never lands on it, so this cannot
+		// be racing another test for a port that just came free.
 		cm := newTestManager(t)
 		_, err := cm.Do(context.Background(),
-			testReq(tee.Request{Method: "POST", Host: host, Path: "/v1/x", Body: []byte("{}")}),
+			testReq(tee.Request{Method: "POST", Host: "127.0.0.1:1", Path: "/v1/x", Body: []byte("{}")}),
 			func([]byte) error { return nil })
 		staged := stageOf(t, err)
 		if staged.Stage != tee.StageDial {
@@ -102,9 +100,12 @@ func TestDoMarksItsOwnTimeout(t *testing.T) {
 	defer srv.Close()
 	defer close(release)
 
+	// Long enough that the request is written and parked on the response even
+	// with the race detector slowing everything down; the test is about which
+	// stage the expiry is reported in, not about how fast the machine is.
 	cm := newTestManager(t)
 	_, err := cm.Do(context.Background(),
-		testReq(tee.Request{Method: "POST", Host: hostOf(srv), Path: "/v1/x", Body: []byte("{}"), Timeout: 50 * time.Millisecond}),
+		testReq(tee.Request{Method: "POST", Host: hostOf(srv), Path: "/v1/x", Body: []byte("{}"), Timeout: 300 * time.Millisecond}),
 		func([]byte) error { return nil })
 	if !errors.Is(err, tee.ErrRequestTimeout) {
 		t.Fatalf("error = %v, want an error carrying tee.ErrRequestTimeout", err)
@@ -159,26 +160,16 @@ func TestDoReportsAWarmConnectionAsWarm(t *testing.T) {
 	}
 }
 
-// racingClock is a context whose deadline has passed while Err still reports
-// nil: the instant between a connection's deadline firing and the context's
-// own timer waking up. That window is unreachable with the standard library's
-// contexts, which is why it is spelled out here — it is exactly the window in
-// which a timeout must not be mistaken for a closed upstream.
-type racingClock struct{ deadline time.Time }
-
-func (c racingClock) Deadline() (time.Time, bool) { return c.deadline, true }
-func (c racingClock) Done() <-chan struct{}       { return nil }
-func (c racingClock) Err() error                  { return nil }
-func (c racingClock) Value(any) any               { return nil }
-
-// TestTimedOutDecidesOnTheClockNotJustTheContext pins the one boundary where
-// the two clocks here disagree. The connection deadline and the context
-// deadline are two timers for the same instant, and a socket can report its
-// own expiry before the context's timer wakes the goroutine that sets Err. If
-// the tag were decided on Err alone, that microsecond would turn the TEE's own
-// timeout into an upstream close, and the Hub would hand the provider a failure
-// the TEE caused.
-func TestTimedOutDecidesOnTheClockNotJustTheContext(t *testing.T) {
+// TestTimedOutBlamesOnlyItsOwnBound pins the boundary this tag must not cross.
+// Request.Timeout is applied here, so a bound that expired is this layer's; a
+// caller's tighter deadline, or no deadline of ours at all, is not — and
+// claiming it would report a TEE timeout for something the caller did.
+//
+// The clock cases matter for the same reason: the connection's deadline and
+// the context's are two timers for one instant, so the socket can report its
+// expiry before ctx.Err() flips. Deciding on the context alone would call that
+// a closed upstream.
+func TestTimedOutBlamesOnlyItsOwnBound(t *testing.T) {
 	sentinel := errors.New("i/o timeout")
 	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancelExpired()
@@ -186,26 +177,49 @@ func TestTimedOutDecidesOnTheClockNotJustTheContext(t *testing.T) {
 	cancel()
 
 	for _, tc := range []struct {
-		name    string
-		ctx     context.Context
-		timeout time.Duration
-		err     error
-		want    bool
+		name string
+		ctx  context.Context
+		own  time.Time
+		err  error
+		want bool
 	}{
-		{"no failure to tag", expired, time.Minute, nil, false},
-		{"no bound of its own", expired, 0, sentinel, false},
-		{"the context already says so", expired, time.Minute, sentinel, true},
-		{"the deadline passed before the context noticed",
-			racingClock{deadline: time.Now().Add(-time.Millisecond)}, time.Minute, sentinel, true},
-		{"still inside the bound",
-			racingClock{deadline: time.Now().Add(time.Hour)}, time.Minute, sentinel, false},
-		{"the caller cancelled, not the bound", cancelled, time.Minute, sentinel, false},
-		{"a context with no deadline at all", context.Background(), time.Minute, sentinel, false},
+		{"no failure to tag", context.Background(), time.Now().Add(-time.Second), nil, false},
+		{"no bound of its own", cancelled, time.Time{}, sentinel, false},
+		{"the bound expired and the context agrees", expired, time.Now().Add(-time.Second), sentinel, true},
+		{"the bound expired before the context noticed", context.Background(), time.Now().Add(-time.Millisecond), sentinel, true},
+		{"still inside the bound", context.Background(), time.Now().Add(time.Hour), sentinel, false},
+		{"cancelled inside the bound", cancelled, time.Now().Add(time.Hour), sentinel, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := errors.Is(timedOut(tc.ctx, tc.timeout, tc.err), tee.ErrRequestTimeout); got != tc.want {
-				t.Errorf("tagged = %v, want %v (err %v)", got, tc.want, timedOut(tc.ctx, tc.timeout, tc.err))
+			if got := errors.Is(timedOut(tc.ctx, tc.own, tc.err), tee.ErrRequestTimeout); got != tc.want {
+				t.Errorf("tagged = %v, want %v (err %v)", got, tc.want, timedOut(tc.ctx, tc.own, tc.err))
 			}
 		})
+	}
+}
+
+// TestDoDoesNotClaimACallerDeadline is the case the tag must never cover: a
+// caller that bounded the exchange more tightly than Request.Timeout. Its
+// expiry is the caller's, and reporting it as the TEE's own timeout would send
+// an operator to the timeout configuration for something nobody here did.
+func TestDoDoesNotClaimACallerDeadline(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	cm := newTestManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := cm.Do(ctx,
+		testReq(tee.Request{Method: "POST", Host: hostOf(srv), Path: "/v1/x", Body: []byte("{}"), Timeout: time.Hour}),
+		func([]byte) error { return nil })
+	if err == nil {
+		t.Fatal("the caller's deadline expired but Do returned no error")
+	}
+	if errors.Is(err, tee.ErrRequestTimeout) {
+		t.Fatalf("error = %v was tagged as the TEE's own timeout, but the bound that expired was the caller's", err)
 	}
 }

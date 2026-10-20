@@ -227,7 +227,16 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 	if m.isClosed() {
 		return tee.Response{}, net.ErrClosed
 	}
+	// ownDeadline is the bound this layer may blame itself for: Request.Timeout,
+	// but only when it is the tightest one in play. A caller that supplied an
+	// earlier deadline bounded the exchange first, and that expiry is the
+	// caller's to answer for, not this layer's (see timedOut).
+	var ownDeadline time.Time
 	if req.Timeout > 0 {
+		ownDeadline = time.Now().Add(req.Timeout)
+		if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(ownDeadline) {
+			ownDeadline = time.Time{}
+		}
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
 		defer cancel()
@@ -243,7 +252,7 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 	tm.Mark(tee.StageAcquire)
 	ch, err := m.acquire(ctx, req)
 	if err != nil {
-		return tee.Response{}, timedOut(ctx, req.Timeout, err)
+		return tee.Response{}, timedOut(ctx, ownDeadline, err)
 	}
 	keep, status, err := ch.exchange(ctx, req, onChunk, m.readBufSize, onStart)
 	if err != nil && ch.wroteNothing() {
@@ -258,12 +267,12 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 		tm.Mark(tee.StageAcquire)
 		ch, err = m.acquire(ctx, req)
 		if err != nil {
-			return tee.Response{}, timedOut(ctx, req.Timeout, err)
+			return tee.Response{}, timedOut(ctx, ownDeadline, err)
 		}
 		keep, status, err = ch.exchange(ctx, req, onChunk, m.readBufSize, onStart)
 	}
 	m.release(ch, keep)
-	return status, timedOut(ctx, req.Timeout, err)
+	return status, timedOut(ctx, ownDeadline, err)
 }
 
 // timedOut marks an exchange error as the exchange's own deadline firing, which
@@ -273,11 +282,12 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 // "the TEE stopped waiting" from "the upstream stopped answering"
 // (see tee.ClassifyFailure).
 //
-// A request with no Timeout of its own gets no tag: then the only deadline in
-// play is the caller's, and attributing its expiry to this layer would be a
-// lie.
-func timedOut(ctx context.Context, timeout time.Duration, err error) error {
-	if err == nil || timeout <= 0 {
+// ownDeadline is zero when this layer has no bound to blame itself for — no
+// Request.Timeout, or a caller deadline that expired first. Then there is
+// nothing to tag: attributing a caller's bound to this layer would be a lie,
+// and a lie in the safe direction is still a lie the Hub would act on.
+func timedOut(ctx context.Context, ownDeadline time.Time, err error) error {
+	if err == nil || ownDeadline.IsZero() {
 		return err
 	}
 	// Two clocks measure the same instant: the context's deadline and the
@@ -286,10 +296,8 @@ func timedOut(ctx context.Context, timeout time.Duration, err error) error {
 	// upstream — the exact misattribution this path exists to remove. Reading
 	// the clock closes the gap. At or past the bound, "we ran out of time" is
 	// the true answer whatever the socket said.
-	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		if deadline, ok := ctx.Deadline(); !ok || time.Now().Before(deadline) {
-			return err
-		}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) && time.Now().Before(ownDeadline) {
+		return err
 	}
 	return fmt.Errorf("%w: %w", tee.ErrRequestTimeout, err)
 }
