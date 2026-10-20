@@ -326,9 +326,11 @@ func readSSE(r io.Reader, onChunk func([]byte) error, onStart ...func(tee.Respon
 			// Diagnosis, not evidence: a frame that will not parse is dropped
 			// rather than allowed to fail an exchange whose receipt may be
 			// perfectly good. The consequence is the state before the frame
-			// existed — the failure is unclassified.
+			// existed — the failure is unclassified. A frame with no class is
+			// dropped for the same reason: it names nothing, and keeping it
+			// would put an empty class into the operator's log.
 			var failure tee.Failure
-			if err := json.Unmarshal([]byte(frame.Data), &failure); err == nil {
+			if err := json.Unmarshal([]byte(frame.Data), &failure); err == nil && failure.Class != "" {
 				result.Failure = &failure
 			}
 		case tee.EventReceipt:

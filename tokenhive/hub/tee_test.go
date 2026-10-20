@@ -460,3 +460,16 @@ func TestReadSSEDropsAnUnreadableFailureFrame(t *testing.T) {
 		t.Errorf("failure = %+v, want nil for an unreadable frame", *result.Failure)
 	}
 }
+
+// TestReadSSEDropsAFailureFrameThatNamesNothing pins the last way a diagnostic
+// frame can be useless: it parses, but carries no class. Keeping it would print
+// an empty reason into the operator's log, which reads like a real answer.
+func TestReadSSEDropsAFailureFrameThatNamesNothing(t *testing.T) {
+	result, err := readSSE(strings.NewReader("event: failure\ndata: {}\n\n"), nil)
+	if !errors.Is(err, ErrNoReceipt) {
+		t.Fatalf("error = %v, want only ErrNoReceipt", err)
+	}
+	if result.Failure != nil {
+		t.Errorf("failure = %+v, want nil for a frame with no class", *result.Failure)
+	}
+}
