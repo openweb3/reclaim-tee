@@ -277,8 +277,19 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 // play is the caller's, and attributing its expiry to this layer would be a
 // lie.
 func timedOut(ctx context.Context, timeout time.Duration, err error) error {
-	if err == nil || timeout <= 0 || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if err == nil || timeout <= 0 {
 		return err
+	}
+	// Two clocks measure the same instant: the context's deadline and the
+	// connection's. The socket can report its failure a hair before ctx.Err()
+	// flips, and deciding on the context alone would call that a closed
+	// upstream — the exact misattribution this path exists to remove. Reading
+	// the clock closes the gap. At or past the bound, "we ran out of time" is
+	// the true answer whatever the socket said.
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if deadline, ok := ctx.Deadline(); !ok || time.Now().Before(deadline) {
+			return err
+		}
 	}
 	return fmt.Errorf("%w: %w", tee.ErrRequestTimeout, err)
 }

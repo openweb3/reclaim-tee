@@ -158,3 +158,54 @@ func TestDoReportsAWarmConnectionAsWarm(t *testing.T) {
 		t.Error("cold = true on a reused connection; the failure cost no dial")
 	}
 }
+
+// racingClock is a context whose deadline has passed while Err still reports
+// nil: the instant between a connection's deadline firing and the context's
+// own timer waking up. That window is unreachable with the standard library's
+// contexts, which is why it is spelled out here — it is exactly the window in
+// which a timeout must not be mistaken for a closed upstream.
+type racingClock struct{ deadline time.Time }
+
+func (c racingClock) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c racingClock) Done() <-chan struct{}       { return nil }
+func (c racingClock) Err() error                  { return nil }
+func (c racingClock) Value(any) any               { return nil }
+
+// TestTimedOutDecidesOnTheClockNotJustTheContext pins the one boundary where
+// the two clocks here disagree. The connection deadline and the context
+// deadline are two timers for the same instant, and a socket can report its
+// own expiry before the context's timer wakes the goroutine that sets Err. If
+// the tag were decided on Err alone, that microsecond would turn the TEE's own
+// timeout into an upstream close, and the Hub would hand the provider a failure
+// the TEE caused.
+func TestTimedOutDecidesOnTheClockNotJustTheContext(t *testing.T) {
+	sentinel := errors.New("i/o timeout")
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		timeout time.Duration
+		err     error
+		want    bool
+	}{
+		{"no failure to tag", expired, time.Minute, nil, false},
+		{"no bound of its own", expired, 0, sentinel, false},
+		{"the context already says so", expired, time.Minute, sentinel, true},
+		{"the deadline passed before the context noticed",
+			racingClock{deadline: time.Now().Add(-time.Millisecond)}, time.Minute, sentinel, true},
+		{"still inside the bound",
+			racingClock{deadline: time.Now().Add(time.Hour)}, time.Minute, sentinel, false},
+		{"the caller cancelled, not the bound", cancelled, time.Minute, sentinel, false},
+		{"a context with no deadline at all", context.Background(), time.Minute, sentinel, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := errors.Is(timedOut(tc.ctx, tc.timeout, tc.err), tee.ErrRequestTimeout); got != tc.want {
+				t.Errorf("tagged = %v, want %v (err %v)", got, tc.want, timedOut(tc.ctx, tc.timeout, tc.err))
+			}
+		})
+	}
+}
