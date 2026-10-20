@@ -46,6 +46,10 @@ type Result struct {
 	Headers map[string][]string
 	// Receipt is the signed proof. Verify it before relying on it.
 	Receipt proof.SignedReceipt
+	// Failure is the TEE's own account of why the exchange did not finish
+	// whole, or nil when it did. It arrives on a frame of its own before the
+	// receipt, and it is not signed: it is diagnosis, not evidence.
+	Failure *tee.Failure
 }
 
 // TEE is the entire Hub↔TEE seam.
@@ -317,6 +321,15 @@ func readSSE(r io.Reader, onChunk func([]byte) error, onStart ...func(tee.Respon
 			result.Headers = start.Headers
 			if len(onStart) > 0 && onStart[0] != nil {
 				onStart[0](tee.Response{StatusCode: start.Status, Headers: start.Headers})
+			}
+		case tee.EventFailure:
+			// Diagnosis, not evidence: a frame that will not parse is dropped
+			// rather than allowed to fail an exchange whose receipt may be
+			// perfectly good. The consequence is the state before the frame
+			// existed — the failure is unclassified.
+			var failure tee.Failure
+			if err := json.Unmarshal([]byte(frame.Data), &failure); err == nil {
+				result.Failure = &failure
 			}
 		case tee.EventReceipt:
 			receipt = frame.Data

@@ -339,7 +339,7 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			err = errors.New("no provider produced a response")
 		}
 		writeJSONError(w, apiErrorStatus(err), err.Error())
-		log.Printf("api model=%q path=%s tenant=%q err=%v", req.Model, c.route.Path, tenant, err)
+		log.Printf("api model=%q path=%s tenant=%q err=%v failure=%v", req.Model, c.route.Path, tenant, err, outcome.Failure)
 		return
 	}
 	// A committed 2xx stream is a success only when the receipt says the
@@ -380,10 +380,10 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	log.Printf("api model=%q path=%s tenant=%q provider=%q status=%d chunks=%d charged=%.2f commission=%.2f buyer=%.2f err=%v",
+	log.Printf("api model=%q path=%s tenant=%q provider=%q status=%d chunks=%d charged=%.2f commission=%.2f buyer=%.2f failure=%v err=%v",
 		req.Model, c.route.Path, tenant, outcome.Receipt.Receipt.Provider, status, chunks,
 		float64(outcome.Charged)/microsPerUnit, float64(outcome.Commission)/microsPerUnit,
-		float64(outcome.Buyer)/microsPerUnit, err)
+		float64(outcome.Buyer)/microsPerUnit, outcome.Failure, err)
 }
 
 // modelsHandler answers GET /v1/models: the buyer-facing market directory.

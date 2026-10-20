@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -420,5 +421,42 @@ func TestCredentialKeyRetriesARetiredConnectionOnce(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 2 {
 		t.Fatalf("TEE saw %d attempts, want exactly 2", got)
+	}
+}
+
+// TestReadSSECarriesTheTEEsAccountOfAFailure pins the Hub half of the failure
+// frame: a failed exchange now arrives with a reason, and it is available even
+// when the stream ends without a receipt — which is the case a Hub most needs
+// it in, since that is the exchange it can neither settle nor explain.
+func TestReadSSECarriesTheTEEsAccountOfAFailure(t *testing.T) {
+	stream := "event: failure\n" +
+		`data: {"class":"request_timeout","stage":"body","cold":true}` + "\n\n"
+	result, err := readSSE(strings.NewReader(stream), nil)
+	if !errors.Is(err, ErrNoReceipt) {
+		t.Fatalf("error = %v, want ErrNoReceipt: there was no receipt frame", err)
+	}
+	if result.Failure == nil {
+		t.Fatal("the failure frame was dropped")
+	}
+	want := tee.Failure{Class: tee.FailureRequestTimeout, Stage: tee.StageBody, Cold: true}
+	if *result.Failure != want {
+		t.Errorf("failure = %+v, want %+v", *result.Failure, want)
+	}
+	if detail := result.Failure.String(); detail != "request_timeout (cold, stage=body)" {
+		t.Errorf("detail = %q", detail)
+	}
+}
+
+// TestReadSSEDropsAnUnreadableFailureFrame pins that diagnosis is not allowed to
+// become evidence: a frame this Hub cannot parse must not fail an exchange whose
+// receipt is perfectly good.
+func TestReadSSEDropsAnUnreadableFailureFrame(t *testing.T) {
+	stream := "event: failure\ndata: not-json\n\n"
+	result, err := readSSE(strings.NewReader(stream), nil)
+	if !errors.Is(err, ErrNoReceipt) {
+		t.Fatalf("error = %v, want only ErrNoReceipt", err)
+	}
+	if result.Failure != nil {
+		t.Errorf("failure = %+v, want nil for an unreadable frame", *result.Failure)
 	}
 }
