@@ -73,8 +73,8 @@ Hub 于是只能从回执的形状反推：没有状态码就是"上游连接失
 | `caller_gone` | Hub 或买家断开 | 否，排除 |
 | `response_too_large` | Hub 自己的响应上限 | 否，排除 |
 | `dial_failed` | Bee 隧道 / 出口 | 是 |
-| `tls_handshake_failed` | TEE 到上游 | 是 |
-| `upstream_closed` | 上游或线路 | 是 |
+| `tls_handshake_failed` | TEE 到上游，先查 TEE 的信任库 | 否。握手失败不是供给方能靠查网络修好的事，这个仓库里历史上它多半是 CA bundle 的问题 |
+| `upstream_closed` | 上游或线路 | 是。注意 Hub 自己知道当时有没有接上 Agent，接不上时它也会关流 |
 | `read_timeout` | 上游慢或线路卡住 | 是 |
 | `other` | 无法归类，保持现状 | 保持现状 |
 | 不认识的 `class` | 更新的 TEE 发明的 | 按 `other` 处理，绝不当成"供给方有错" |
