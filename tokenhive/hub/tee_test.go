@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -420,5 +421,86 @@ func TestCredentialKeyRetriesARetiredConnectionOnce(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 2 {
 		t.Fatalf("TEE saw %d attempts, want exactly 2", got)
+	}
+}
+
+// TestReadSSECarriesTheTEEsAccountOfAFailure pins the Hub half of the failure
+// frame: a failed exchange now arrives with a reason, and it is available even
+// when the stream ends without a receipt — which is the case a Hub most needs
+// it in, since that is the exchange it can neither settle nor explain.
+func TestReadSSECarriesTheTEEsAccountOfAFailure(t *testing.T) {
+	// One response chunk and one diagnostic frame. The chunk is what the
+	// receipt hashes; the frame must not become a second one, or every receipt
+	// for a failed exchange would fail its stream check.
+	stream := "event: failure\n" +
+		`data: {"class":"request_timeout","stage":"body","cold":true}` + "\n\n" +
+		"data: payload\n\n"
+	result, err := readSSE(strings.NewReader(stream), nil)
+	if !errors.Is(err, ErrNoReceipt) {
+		t.Fatalf("error = %v, want ErrNoReceipt: there was no receipt frame", err)
+	}
+	if result.Failure == nil {
+		t.Fatal("the failure frame was dropped")
+	}
+	want := tee.Failure{Class: tee.FailureRequestTimeout, Stage: tee.StageBody, Cold: true}
+	if *result.Failure != want {
+		t.Errorf("failure = %+v, want %+v", *result.Failure, want)
+	}
+	if detail := result.Failure.String(); detail != "request_timeout (cold, stage=body)" {
+		t.Errorf("detail = %q", detail)
+	}
+	if len(result.Chunks) != 1 || string(result.Chunks[0]) != "payload" {
+		t.Errorf("chunks = %q, want exactly the response payload", result.Chunks)
+	}
+}
+
+// TestReadSSEDropsAnUnreadableFailureFrame pins that diagnosis is not allowed to
+// become evidence: a frame this Hub cannot parse must not fail an exchange whose
+// receipt is perfectly good.
+func TestReadSSEDropsAnUnreadableFailureFrame(t *testing.T) {
+	stream := "event: failure\ndata: not-json\n\n"
+	result, err := readSSE(strings.NewReader(stream), nil)
+	if !errors.Is(err, ErrNoReceipt) {
+		t.Fatalf("error = %v, want only ErrNoReceipt", err)
+	}
+	if result.Failure != nil {
+		t.Errorf("failure = %+v, want nil for an unreadable frame", *result.Failure)
+	}
+}
+
+// TestReadSSEDropsAFailureFrameThatNamesNothing pins the last way a diagnostic
+// frame can be useless: it parses, but carries no class. Keeping it would print
+// an empty reason into the operator's log, which reads like a real answer.
+func TestReadSSEDropsAFailureFrameThatNamesNothing(t *testing.T) {
+	result, err := readSSE(strings.NewReader("event: failure\ndata: {}\n\n"), nil)
+	if !errors.Is(err, ErrNoReceipt) {
+		t.Fatalf("error = %v, want only ErrNoReceipt", err)
+	}
+	if result.Failure != nil {
+		t.Errorf("failure = %+v, want nil for a frame with no class", *result.Failure)
+	}
+}
+
+// TestReadSSEFoldsAnUnknownClassIntoOther pins the rolling-upgrade rule at the
+// boundary: a class this Hub has never heard of is a newer TEE's vocabulary,
+// and this Hub cannot attribute it. Folding it into "other" here is what keeps
+// an unknown token from reaching code that switches on the vocabulary and
+// landing in a branch that blames the provider. The stage and cold it came
+// with survive, so the diagnosis is still usable.
+func TestReadSSEFoldsAnUnknownClassIntoOther(t *testing.T) {
+	stream := "event: failure\n" +
+		"data: {\"class\":\"quota_negotiation_failed\",\"stage\":\"body\",\"cold\":true}\n\n"
+	result, err := readSSE(strings.NewReader(stream), nil)
+	if !errors.Is(err, ErrNoReceipt) {
+		t.Fatalf("error = %v, want only ErrNoReceipt", err)
+	}
+	if result.Failure == nil {
+		t.Fatal("an unknown class was dropped; it is still a failure worth reporting")
+	}
+	if result.Failure.Class != tee.FailureOther {
+		t.Errorf("class = %q, want %q", result.Failure.Class, tee.FailureOther)
+	}
+	if result.Failure.Stage != tee.StageBody || !result.Failure.Cold {
+		t.Errorf("failure = %+v, want the stage and cold kept", *result.Failure)
 	}
 }

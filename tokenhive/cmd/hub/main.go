@@ -334,10 +334,17 @@ func wsEndpoint(base, path string) string {
 
 func printOutcome(outcome hub.Outcome) {
 	r := outcome.Receipt.Receipt
-	fmt.Printf("[receipt] provider=%s seq=%d requestBytes=%d responseBytes=%d chunks=%d status=%d completion=%s charged=%.2f commission=%.2f buyer=%.2f\n",
+	// The class the TEE sent is printed beside the receipt it describes, so the
+	// harness can assert that a failure it caused on purpose came back
+	// attributed to the right thing. "-" means the exchange finished whole.
+	failure := "-"
+	if outcome.Failure != nil {
+		failure = outcome.Failure.String()
+	}
+	fmt.Printf("[receipt] provider=%s seq=%d requestBytes=%d responseBytes=%d chunks=%d status=%d completion=%s charged=%.2f commission=%.2f buyer=%.2f failure=%s\n",
 		r.Provider, r.ProviderSeq, r.RequestBytes, r.ResponseBytes, r.ChunkCount,
 		r.StatusCode, r.Completion, float64(outcome.Charged)/microsPerUnit,
-		float64(outcome.Commission)/microsPerUnit, float64(outcome.Buyer)/microsPerUnit)
+		float64(outcome.Commission)/microsPerUnit, float64(outcome.Buyer)/microsPerUnit, failure)
 	if !outcome.Stored {
 		fmt.Printf("[withhold] receipt seq=%d kept out of the provider's store\n", r.ProviderSeq)
 	}

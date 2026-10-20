@@ -227,7 +227,16 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 	if m.isClosed() {
 		return tee.Response{}, net.ErrClosed
 	}
+	// ownDeadline is the bound this layer may blame itself for: Request.Timeout,
+	// but only when it is the tightest one in play. A caller that supplied an
+	// earlier deadline bounded the exchange first, and that expiry is the
+	// caller's to answer for, not this layer's (see timedOut).
+	var ownDeadline time.Time
 	if req.Timeout > 0 {
+		ownDeadline = time.Now().Add(req.Timeout)
+		if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(ownDeadline) {
+			ownDeadline = time.Time{}
+		}
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
 		defer cancel()
@@ -243,7 +252,7 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 	tm.Mark(tee.StageAcquire)
 	ch, err := m.acquire(ctx, req)
 	if err != nil {
-		return tee.Response{}, err
+		return tee.Response{}, timedOut(ctx, ownDeadline, err)
 	}
 	keep, status, err := ch.exchange(ctx, req, onChunk, m.readBufSize, onStart)
 	if err != nil && ch.wroteNothing() {
@@ -258,12 +267,39 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 		tm.Mark(tee.StageAcquire)
 		ch, err = m.acquire(ctx, req)
 		if err != nil {
-			return tee.Response{}, err
+			return tee.Response{}, timedOut(ctx, ownDeadline, err)
 		}
 		keep, status, err = ch.exchange(ctx, req, onChunk, m.readBufSize, onStart)
 	}
 	m.release(ch, keep)
-	return status, err
+	return status, timedOut(ctx, ownDeadline, err)
+}
+
+// timedOut marks an exchange error as the exchange's own deadline firing, which
+// only this layer can tell: Do applies Request.Timeout itself, so when that
+// bound fires the caller's context is still healthy and the error is an
+// ordinary socket timeout. The service reads the sentinel back to separate
+// "the TEE stopped waiting" from "the upstream stopped answering"
+// (see tee.ClassifyFailure).
+//
+// ownDeadline is zero when this layer has no bound to blame itself for — no
+// Request.Timeout, or a caller deadline that expired first. Then there is
+// nothing to tag: attributing a caller's bound to this layer would be a lie,
+// and a lie in the safe direction is still a lie the Hub would act on.
+func timedOut(ctx context.Context, ownDeadline time.Time, err error) error {
+	if err == nil || ownDeadline.IsZero() {
+		return err
+	}
+	// Two clocks measure the same instant: the context's deadline and the
+	// connection's. The socket can report its failure a hair before ctx.Err()
+	// flips, and deciding on the context alone would call that a closed
+	// upstream — the exact misattribution this path exists to remove. Reading
+	// the clock closes the gap. At or past the bound, "we ran out of time" is
+	// the true answer whatever the socket said.
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) && time.Now().Before(ownDeadline) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", tee.ErrRequestTimeout, err)
 }
 
 // Close makes the manager terminal: it stops the idle sweeper, closes every
@@ -405,9 +441,15 @@ func (m *ChannelManager) acquire(ctx context.Context, req tee.Request) (*channel
 	}
 	ch, dial, err := pool.acquire(ctx)
 	if err != nil {
-		return nil, err
+		// Nothing was dialed: what failed is the wait for a slot, which is the
+		// one failure here that is about this TEE's own capacity rather than
+		// about the provider.
+		return nil, &tee.StageError{Stage: tee.StageAcquire, Err: err}
 	}
 	if !dial {
+		// A pooled connection is warm however it was born: this exchange did
+		// not pay to establish it.
+		ch.cold = false
 		return ch, nil
 	}
 	conn, err := m.dialTCP(ctx, req)
@@ -415,7 +457,7 @@ func (m *ChannelManager) acquire(ctx context.Context, req tee.Request) (*channel
 		pool.releaseSlot()
 		return nil, err
 	}
-	return &channel{conn: conn, br: bufio.NewReader(conn), pool: pool}, nil
+	return &channel{conn: conn, br: bufio.NewReader(conn), pool: pool, cold: true}, nil
 }
 
 // release returns an open channel to its pool, or closes it when keep is false.
@@ -451,7 +493,10 @@ func (m *ChannelManager) dialTCP(ctx context.Context, req tee.Request) (net.Conn
 		conn, err = d.DialContext(ctx, "tcp", req.Host)
 	}
 	if err != nil {
-		return nil, err
+		// Reaching here means no stream to the provider exists, which is a
+		// different thing from one that opened and then went quiet: this is the
+		// tunnel, the agent's attachment, or the dial, never the upstream.
+		return nil, &tee.StageError{Stage: tee.StageDial, Cold: true, Err: err}
 	}
 	if m.scheme != "https" {
 		return conn, nil
@@ -501,7 +546,7 @@ func (m *ChannelManager) wrapTLS(ctx context.Context, conn net.Conn, req tee.Req
 			log.Printf("upstream TLS handshake to %s failed: %v", req.Host, err)
 		}
 		_ = conn.Close()
-		return nil, err
+		return nil, &tee.StageError{Stage: tee.StageTLS, Cold: true, Err: err}
 	}
 	return tconn, nil
 }

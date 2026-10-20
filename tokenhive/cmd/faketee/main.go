@@ -109,7 +109,10 @@ func (scriptedTransport) Do(ctx context.Context, req tee.Request, onChunk func([
 			return tee.Response{StatusCode: 200}, err
 		}
 	}
-	return tee.Response{StatusCode: 200}, errors.New("simulated provider dropped the connection mid-stream")
+	return tee.Response{StatusCode: 200}, &tee.StageError{
+		Stage: tee.StageBody,
+		Err:   errors.New("simulated provider dropped the connection mid-stream"),
+	}
 }
 
 // queryParam fetches the value of a single key from an already-escaped query
