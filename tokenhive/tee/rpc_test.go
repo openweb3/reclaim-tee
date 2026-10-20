@@ -2,6 +2,8 @@ package tee
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -170,4 +172,86 @@ type deadlineRecorder struct {
 func (d *deadlineRecorder) SetReadDeadline(t time.Time) error {
 	d.deadlines = append(d.deadlines, t)
 	return nil
+}
+
+// serveExecuteFrames drives one request through the handler and returns the
+// frames it wrote, in order. The failure frame is the one piece of the stream
+// with no receipt to keep it honest, so its position is worth pinning: the Hub
+// settles against the receipt, and a diagnosis that arrives after it would be
+// read too late to describe the exchange it belongs to.
+func serveExecuteFrames(t *testing.T, env *testEnv, payload []byte) []SSEEvent {
+	t.Helper()
+	spec := env.spec(t, payload)
+	body, err := ExecuteRequest{Spec: spec, Body: payload}.EncodeCanonical()
+	if err != nil {
+		t.Fatalf("encode execute request: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	ServeExecute(env.service, rec, httptest.NewRequest(http.MethodPost, "/v1/execute", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("execute status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var frames []SSEEvent
+	stream := NewSSEStream(rec.Body)
+	for {
+		frame, err := stream.Next()
+		if err != nil {
+			return frames
+		}
+		frames = append(frames, frame)
+	}
+}
+
+// TestServeExecuteSaysWhyTheExchangeFailed pins the whole path a diagnosis
+// takes: a transport error the TEE's own vocabulary can place, classified by
+// the service, emitted as a frame ahead of the receipt that attests the same
+// exchange. Before this frame existed the Hub saw CompletionFailed and a zero
+// status, which is what a provider that never answered looks like too.
+func TestServeExecuteSaysWhyTheExchangeFailed(t *testing.T) {
+	env := newTestEnv(t)
+	env.transport.statusCode = 0
+	env.transport.chunks = nil
+	env.transport.failAfter = 0
+	env.transport.err = &StageError{Stage: StageTTFB, Cold: true, Err: io.EOF}
+
+	frames := serveExecuteFrames(t, env, []byte(`{"model":"m"}`))
+
+	var failureAt, receiptAt = -1, -1
+	for i, frame := range frames {
+		switch frame.Type {
+		case EventFailure:
+			failureAt = i
+		case EventReceipt:
+			receiptAt = i
+		}
+	}
+	if failureAt < 0 {
+		t.Fatal("no failure frame: the Hub has nothing to tell the provider from")
+	}
+	if receiptAt < 0 {
+		t.Fatal("no receipt frame")
+	}
+	if failureAt > receiptAt {
+		t.Fatalf("failure frame written after the receipt (frames %d and %d); the Hub settles before it could read the diagnosis", failureAt, receiptAt)
+	}
+
+	var failure Failure
+	if err := json.Unmarshal([]byte(frames[failureAt].Data), &failure); err != nil {
+		t.Fatalf("decode failure frame: %v", err)
+	}
+	if failure.Class != FailureUpstreamClosed || failure.Stage != StageTTFB || !failure.Cold {
+		t.Errorf("failure = %+v, want upstream_closed at ttfb on a cold connection", failure)
+	}
+}
+
+// TestServeExecuteSaysNothingExtraWhenTheExchangeCompleted pins the other half
+// of the contract: silence means the exchange finished whole, so a Hub never
+// has to tell "no diagnosis" from "a diagnosis it could not read".
+func TestServeExecuteSaysNothingExtraWhenTheExchangeCompleted(t *testing.T) {
+	env := newTestEnv(t)
+	for _, frame := range serveExecuteFrames(t, env, []byte(`{"model":"m"}`)) {
+		if frame.Type == EventFailure {
+			t.Fatalf("a completed exchange emitted a failure frame: %q", frame.Data)
+		}
+	}
 }

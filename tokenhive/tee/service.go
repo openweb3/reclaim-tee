@@ -150,6 +150,11 @@ type Result struct {
 	// cap or by the connection dropping.
 	Truncated bool
 
+	// Failure is why the exchange did not complete whole, or nil when it did.
+	// It is not signed and not part of the receipt: it says where the request
+	// died, which is the one thing the receipt cannot express.
+	Failure *Failure
+
 	// PolicyHash names the policy revision that authorised the job.
 	PolicyHash []byte
 
@@ -809,6 +814,12 @@ func (s *Service) perform(
 ) (*Result, error) {
 	hasher := proof.NewStreamingHasher(spec.JobID)
 	truncated := false
+	// stopErr is what the relay itself raised, as opposed to what the transport
+	// returned: the byte cap, or the caller failing while it was being written
+	// to. The transport's error describes the consequence of either, and the
+	// difference between "we stopped it" and "it broke" is the whole point of
+	// classifying the failure (see ClassifyFailure).
+	var stopErr error
 	tm := TimingsFrom(ctx)
 
 	// The signer this exchange starts under is the one its receipt should name.
@@ -878,7 +889,8 @@ func (s *Service) perform(
 		// ResponseBytes/ChunkCount instead.
 		if hasher.BytesWritten()+uint64(len(chunk)) > request.MaxResponseBytes {
 			truncated = true
-			return ErrResponseBodyTooLarge
+			stopErr = ErrResponseBodyTooLarge
+			return stopErr
 		}
 		if err := hasher.WriteChunk(chunk); err != nil {
 			return err
@@ -891,6 +903,7 @@ func (s *Service) perform(
 			// The response is partial from the caller's point of view even
 			// though the exchange itself completed.
 			truncated = true
+			stopErr = err
 			return err
 		}
 		return nil
@@ -899,6 +912,11 @@ func (s *Service) perform(
 	startedAt := s.clock().Unix()
 	response, err := s.transport.Do(ctx, request, relay, start)
 	finishedAt := s.clock().Unix()
+
+	// Why it ended, before anything else reads err: the classification is the
+	// only thing that turns a transport error into something the Hub can act
+	// on, and it is what the failure frame carries (see ServeExecute).
+	failure := ClassifyFailure(err, stopErr, ctx.Err())
 
 	// What the provider sent is final the moment the exchange returns, whatever
 	// it returned with, so the record takes it here rather than at the end —
@@ -1016,6 +1034,7 @@ func (s *Service) perform(
 		Truncated:   truncated || completion == proof.CompletionTruncated,
 		PolicyHash:  decision.PolicyHash,
 		ProviderSeq: seq,
+		Failure:     failure,
 	}
 	return result, nil
 }

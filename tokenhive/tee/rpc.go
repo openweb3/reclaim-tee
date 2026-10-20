@@ -16,8 +16,8 @@ import (
 )
 
 // The Hub↔TEE interface is a single RPC: POST /v1/execute carrying a canonical
-// ExecuteRequest, answered by an SSE stream with three kinds of frame in a
-// fixed order:
+// ExecuteRequest, answered by an SSE stream with four kinds of frame in a fixed
+// order:
 //
 //  1. 响应开始 — event: start, one frame carrying the upstream status code and
 //     the allowlisted response headers (see ForwardResponseHeaders), emitted
@@ -26,7 +26,11 @@ import (
 //     as a stream, a 401 or 429 is surfaced as the error it is.
 //  2. 响应片段 — data: frames carrying the raw response body, unchanged. The
 //     receipt's stream hash commits to exactly these bytes.
-//  3. 执行结束 — event: receipt, the signed proof of the exchange. The receipt
+//  3. 失败原因 — event: failure, emitted only when the exchange did not finish
+//     whole, immediately before the receipt that attests it. It carries the
+//     class and the stage (see Failure), which is the one thing the receipt
+//     cannot say: the receipt proves a stream was cut, not who cut it.
+//  4. 执行结束 — event: receipt, the signed proof of the exchange. The receipt
 //     binds all three parts: the status (StatusCode), the forwarded headers
 //     (ResponseHeadersHash), and the body (StreamHash).
 //
@@ -39,6 +43,17 @@ const (
 	// EventStart names the first frame of a response: the upstream status code
 	// plus the response headers the Hub is allowed to see, as JSON.
 	EventStart = "start"
+
+	// EventFailure names the frame that says why an exchange did not complete:
+	// a Failure as JSON, sent before the receipt it belongs to. It is absent
+	// when the exchange finished whole, so silence means complete.
+	//
+	// Deliberately not part of the signed receipt. A receipt field is frozen
+	// the day a signature covers it, and this vocabulary is still being
+	// learned; nothing settles on it either. The frame rides the same attested
+	// connection as the receipt, so it is as attributable as anything else the
+	// TEE says — it is just not portable evidence.
+	EventFailure = "failure"
 
 	// EventReceipt names the final SSE frame, whose data is the base64 of a
 	// canonical SignedReceipt.
@@ -229,6 +244,13 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tm.Mark(StageEmit)
+	// Before the receipt, because the Hub settles against the receipt: a Hub
+	// that has verified one should already hold the TEE's account of why the
+	// exchange did not finish. Nothing here is fatal to the stream — a receipt
+	// is the evidence whether or not a diagnostic rode ahead of it.
+	if res.Failure != nil {
+		writeFailureFrame(w, flusher, *res.Failure)
+	}
 	enc, err := res.Receipt.EncodeCanonical()
 	if err != nil {
 		timingErr = err
@@ -281,6 +303,22 @@ func writeChunkFrame(w io.Writer, chunk []byte) {
 		fmt.Fprintf(w, "data: %s\n", line)
 	}
 	fmt.Fprint(w, "\n")
+}
+
+// writeFailureFrame emits the failure-diagnosis frame: the class, the stage it
+// happened in, and whether a new connection was being established, as JSON on a
+// single data line.
+//
+// json.Marshal cannot fail on these fields — they are a string and a bool — so
+// the fallback exists only to keep a corrupt frame from taking the receipt
+// down with it. A Hub that cannot read the frame treats the exchange as
+// unclassified, which is exactly the state it was in before the frame existed.
+func writeFailureFrame(w http.ResponseWriter, flusher http.Flusher, failure Failure) {
+	enc, err := json.Marshal(failure)
+	if err != nil {
+		enc = []byte(`{"class":"other"}`)
+	}
+	writeEvent(w, flusher, EventFailure, string(enc))
 }
 
 // writeEvent emits one SSE frame. Entries are flushed individually because the

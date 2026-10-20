@@ -384,6 +384,16 @@ func TestEndToEndMidStreamDisconnect(t *testing.T) {
 	if len(relayed) == 0 {
 		t.Error("nothing was relayed before the disconnect")
 	}
+	// The reason has to survive the same trip the receipt does: through the
+	// provider agent, the relay and the transport's own stage tagging. A
+	// truncated receipt says the stream was cut; only this says the upstream
+	// cut it, which is the distinction the Hub blames providers on.
+	if result.Failure == nil {
+		t.Fatal("no failure class on a truncated exchange")
+	}
+	if result.Failure.Class != tee.FailureUpstreamClosed || result.Failure.Stage != tee.StageBody {
+		t.Errorf("failure = %+v, want upstream_closed at body", *result.Failure)
+	}
 
 	// The receipt for a failed exchange is worth exactly as much as one for a
 	// success — it must verify and cover the job either way.
