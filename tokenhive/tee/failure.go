@@ -121,24 +121,17 @@ type Failure struct {
 // `dial_failed (cold, stage=dial)`. The class alone when there is nothing to
 // add, which is the common case for a failure the caller caused.
 func (f Failure) String() string {
-	if f.Stage == "" && !f.Cold {
-		return string(f.Class)
-	}
-	var b strings.Builder
-	b.WriteString(string(f.Class))
-	b.WriteString(" (")
+	var attributes []string
 	if f.Cold {
-		b.WriteString("cold")
-		if f.Stage != "" {
-			b.WriteString(", ")
-		}
+		attributes = append(attributes, "cold")
 	}
 	if f.Stage != "" {
-		b.WriteString("stage=")
-		b.WriteString(f.Stage)
+		attributes = append(attributes, "stage="+f.Stage)
 	}
-	b.WriteString(")")
-	return b.String()
+	if len(attributes) == 0 {
+		return string(f.Class)
+	}
+	return string(f.Class) + " (" + strings.Join(attributes, ", ") + ")"
 }
 
 // ClassifyFailure names why an exchange did not complete, and returns nil for
