@@ -329,8 +329,18 @@ func readSSE(r io.Reader, onChunk func([]byte) error, onStart ...func(tee.Respon
 			// existed — the failure is unclassified. A frame with no class is
 			// dropped for the same reason: it names nothing, and keeping it
 			// would put an empty class into the operator's log.
+			//
+			// A class this Hub does not know is a newer TEE's vocabulary during
+			// a rollout. It is folded into FailureOther here, at the boundary,
+			// rather than left for each consumer to handle: this Hub cannot act
+			// on a name it has never seen, and a value that falls through a
+			// switch is how an unknown failure becomes the provider's fault.
+			// The stage and cold it came with are kept.
 			var failure tee.Failure
 			if err := json.Unmarshal([]byte(frame.Data), &failure); err == nil && failure.Class != "" {
+				if !failure.Class.Known() {
+					failure.Class = tee.FailureOther
+				}
 				result.Failure = &failure
 			}
 		case tee.EventReceipt:

@@ -480,3 +480,27 @@ func TestReadSSEDropsAFailureFrameThatNamesNothing(t *testing.T) {
 		t.Errorf("failure = %+v, want nil for a frame with no class", *result.Failure)
 	}
 }
+
+// TestReadSSEFoldsAnUnknownClassIntoOther pins the rolling-upgrade rule at the
+// boundary: a class this Hub has never heard of is a newer TEE's vocabulary,
+// and this Hub cannot attribute it. Folding it into "other" here is what keeps
+// an unknown token from reaching code that switches on the vocabulary and
+// landing in a branch that blames the provider. The stage and cold it came
+// with survive, so the diagnosis is still usable.
+func TestReadSSEFoldsAnUnknownClassIntoOther(t *testing.T) {
+	stream := "event: failure\n" +
+		"data: {\"class\":\"quota_negotiation_failed\",\"stage\":\"body\",\"cold\":true}\n\n"
+	result, err := readSSE(strings.NewReader(stream), nil)
+	if !errors.Is(err, ErrNoReceipt) {
+		t.Fatalf("error = %v, want only ErrNoReceipt", err)
+	}
+	if result.Failure == nil {
+		t.Fatal("an unknown class was dropped; it is still a failure worth reporting")
+	}
+	if result.Failure.Class != tee.FailureOther {
+		t.Errorf("class = %q, want %q", result.Failure.Class, tee.FailureOther)
+	}
+	if result.Failure.Stage != tee.StageBody || !result.Failure.Cold {
+		t.Errorf("failure = %+v, want the stage and cold kept", *result.Failure)
+	}
+}
