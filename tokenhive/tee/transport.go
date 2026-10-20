@@ -13,6 +13,41 @@ import (
 // partial response from a whole one.
 var ErrResponseBodyTooLarge = errors.New("response body exceeds the allowed size")
 
+// ErrRequestTimeout means Request.Timeout elapsed while the exchange was still
+// running.
+//
+// The transport is the only component that knows this, because it is the only
+// one that applies that bound: the service hands the exchange a context with no
+// deadline of its own (see TestExchangeIsGivenNoDeadlineOfItsOwn), so when the
+// bound fires the exchange context is still healthy and the error that surfaces
+// is an ordinary socket timeout. A transport therefore wraps the error with
+// this sentinel, and the service reads it back to tell "the TEE stopped waiting"
+// from "the upstream stopped answering".
+var ErrRequestTimeout = errors.New("the exchange's own timeout elapsed")
+
+// StageError is an exchange failure that names the phase it happened in.
+//
+// It exists because the stage is the difference between two failures that look
+// identical from outside: a stream that was never opened and one that opened
+// and then said nothing both end as "no response". The stage names are the
+// timing record's own vocabulary, so a log line, a metrics store and the
+// failure class the Hub is sent cannot disagree about where a request died.
+//
+// It also carries cold, which only the transport knows: whether this exchange
+// paid to establish a connection or rode one already in the pool.
+type StageError struct {
+	// Stage is one of the Stage* names.
+	Stage string
+	// Cold reports that the exchange had opened a new provider connection.
+	Cold bool
+	// Err is the underlying failure.
+	Err error
+}
+
+func (e *StageError) Error() string { return e.Err.Error() }
+
+func (e *StageError) Unwrap() error { return e.Err }
+
 // ErrNoTransport means the service was built without a transport. It is a
 // wiring error, not a runtime one: a service that cannot reach a provider must
 // refuse to be constructed rather than fail every job with a receipt claiming

@@ -34,10 +34,22 @@ type channel struct {
 	// exchange failure means nothing left the TEE, so the request is safe to
 	// re-dial exactly once.
 	wrote int
+	// cold reports that this checkout dialed a new connection rather than
+	// reusing a pooled one. Set by acquire on every checkout, and read only
+	// when the exchange fails — it is what tells a failure that cost a
+	// connection from one that cost nothing.
+	cold bool
 }
 
 // wroteNothing reports whether no bytes were written to the wire.
 func (ch *channel) wroteNothing() bool { return ch.wrote == 0 }
+
+// fail tags an exchange failure with the stage it happened in, so the reason
+// survives all the way to the Hub (see tee.ClassifyFailure) instead of being
+// flattened into "the response did not finish".
+func (ch *channel) fail(stage string, err error) error {
+	return &tee.StageError{Stage: stage, Cold: ch.cold, Err: err}
+}
 
 // channelPool is the resident-connection pool for one (provider, host). It
 // tracks how many connections are alive and reaps those idle past the window.
@@ -235,10 +247,10 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 	n, werr := ch.conn.Write(requestBytes)
 	ch.wrote = n
 	if werr != nil {
-		return false, tee.Response{}, fmt.Errorf("write request: %w", werr)
+		return false, tee.Response{}, ch.fail(tee.StageWrite, fmt.Errorf("write request: %w", werr))
 	}
 	if n != len(requestBytes) {
-		return false, tee.Response{}, io.ErrShortWrite
+		return false, tee.Response{}, ch.fail(tee.StageWrite, io.ErrShortWrite)
 	}
 
 	tm.Mark(tee.StageTTFB)
@@ -247,7 +259,7 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 	// request bytes ourselves.
 	resp, err := http.ReadResponse(ch.br, &http.Request{Method: req.Method})
 	if err != nil {
-		return false, tee.Response{}, fmt.Errorf("read response headers: %w", err)
+		return false, tee.Response{}, ch.fail(tee.StageTTFB, fmt.Errorf("read response headers: %w", err))
 	}
 	status = tee.Response{StatusCode: uint32(resp.StatusCode), Headers: resp.Header}
 
@@ -274,7 +286,7 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 		if n > 0 {
 			if cerr := onChunk(buf[:n]); cerr != nil {
 				_ = resp.Body.Close()
-				return false, status, cerr
+				return false, status, ch.fail(tee.StageBody, cerr)
 			}
 		}
 		if rerr == io.EOF {
@@ -283,7 +295,7 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 		if rerr != nil {
 			keep = false
 			_ = resp.Body.Close()
-			return false, status, rerr
+			return false, status, ch.fail(tee.StageBody, rerr)
 		}
 	}
 	_ = resp.Body.Close()
