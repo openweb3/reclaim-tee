@@ -31,7 +31,7 @@
 
 | 端点 | 方法 | 用途 | 请求 Content-Type | 响应 |
 |---|---|---|---|---|
-| `/v1/execute` | POST | 一次性执行：TEE 用 Provider 凭证发一次上游请求，流式回传字节，末尾给回执 | `application/cbor` | `text/event-stream`（chunk 帧 + `receipt`/`error` 帧） |
+| `/v1/execute` | POST | 一次性执行：TEE 用 Provider 凭证发一次上游请求，流式回传字节，末尾给回执 | `application/cbor` | `text/event-stream`（chunk 帧 + `failure`/`receipt`/`error` 帧） |
 | `/v1/session` | GET（WebSocket Upgrade） | 长会话（Realtime 类）：Upgrade 后双向透传字节，结束时给会话回执 | — | WebSocket：Binary 帧透传，Text 帧为控制/回执 |
 | `/v1/credential-key` | GET | **凭证平面**：发布 TEE 的收件公钥（InboxKey 公钥半），供 Provider Agent 拉取后用其加密自己的 token | — | `application/json`（`key_id` + `public_key`，base64） |
 
@@ -152,7 +152,7 @@ TEE 的校验顺序（与 `tee.Service.Execute` 一致）。**除第 1 步外**�
 
 ### 4.2 响应（`text/event-stream`）
 
-三类帧：
+四类帧，顺序固定：`start`（有响应时才有）→ chunk 若干 → `failure`（失败时才有）→ `receipt`。
 
 **(a) 数据帧（chunk）**——上游响应体的原始字节切片：
 
@@ -169,7 +169,34 @@ data: <line2>\n
 - **尾部空白是载荷**，不得 trim；
 - **空 chunk 也要算一次**（心跳/空写计入 ChunkCount 与流哈希），不得跳过。
 
-**(b) 回执帧（终止，成功路径）**：
+**(b) 失败原因帧（诊断，可选）**——仅在这次执行没有完整结束时出现，紧挨着它所描述的那条回执之前：
+
+```
+event: failure
+data: {"class":"dial_failed","stage":"dial","cold":true}
+
+```
+
+`stage`、`cold` 可省略。`class` 是封闭集合，语义见下表。
+
+| `class` | 什么时候是这个值 | TEE 实际遇到的事 |
+| --- | --- | --- |
+| `request_timeout` | TEE 自己的 `Request.Timeout` 到期 | 不是上游停了，是 TEE 不等了 |
+| `caller_gone` | 向 Hub 写 chunk 失败，或交换的 context 被取消 | Hub 或买家不再接收 |
+| `response_too_large` | 触达作业的 `MaxResponseBytes` | Hub 自己设的上限 |
+| `dial_failed` | 到 Provider 的流没建立起来（隧道断、Agent 未接入、拨号超时） | 字节一个都没发出去 |
+| `tls_handshake_failed` | 到上游的 TLS 握手失败 | 上游证书，或本 enclave 的信任库 |
+| `upstream_closed` | 状态行之前或正文中途连接结束 | 上游关了、路上断了，或 Hub 没能把流接到 Agent（流被直接关闭） |
+| `read_timeout` | 读超时，且不是 `Request.Timeout` 造成的 | 某个内层时钟到期 |
+| `other` | 以上都不是 | 本版本无法归类 |
+
+`stage` 取计量阶段的名字（`dial` / `tls` / `write` / `ttfb` / `body` / `acquire`），是区分"从没打开过流"和"流开了但一直没数据"的唯一依据——这两种从外面看都是"没有响应"。
+
+> **这一帧不签名，也不进回执。** 回执字段一旦被签名覆盖就冻结了，而这套分类还在积累；今天也没有任何结算依赖它。它走的是同一条经过远程证明的 TLS 连接，来源和回执一样是那个被度量的 enclave，区别只是它不是可携带的证据。哪天要按原因结算，再加回执字段——到那时该签哪些类比现在清楚。
+>
+> 读不懂这一帧（字段不认识、JSON 坏了）应当当作"没有诊断"，不要让一次收据完好的执行因此失败。缺失这一帧 = 执行完整结束。
+
+**(c) 回执帧（终止，执行路径）**：
 
 ```
 event: receipt
@@ -177,7 +204,7 @@ data: <base64( canonical SignedReceipt )>
 
 ```
 
-**(c) 错误帧（终止，拒绝路径）**：
+**(d) 错误帧（终止，拒绝路径）**：
 
 ```
 event: error
@@ -190,9 +217,10 @@ data: <原因文本（单行）>
 ### 4.3 调用方必须做的校验
 
 1. 收集所有 chunk（按 4.2 规则还原字节，不 trim）；
-2. 解析 `receipt` 帧 → `SignedReceipt`；
-3. `proof.Verify(signed, opts)`（第 8 章）；
-4. `signed.Receipt.MatchesStream(chunks)`——校验回执的 StreamHash 覆盖的就是你收到的字节。**这一步不能省**：它是"Hub 交给用户的字节 == TEE 见证的字节"的唯一保证。
+2. 若出现 `failure` 帧，记下 `class`／`stage`／`cold`（诊断，见 4.2(b)）；
+3. 解析 `receipt` 帧 → `SignedReceipt`；
+4. `proof.Verify(signed, opts)`（第 8 章）；
+5. `signed.Receipt.MatchesStream(chunks)`——校验回执的 StreamHash 覆盖的就是你收到的字节。**这一步不能省**：它是"Hub 交给用户的字节 == TEE 见证的字节"的唯一保证。
 
 ---
 
@@ -553,7 +581,7 @@ hub -audit -provider openai-sim   # 只看一个 Provider
 | `submitter rejected: …` | 部署方启用了 `SubmitterVerifier` 并拒绝该提交方 | 否 |
 | 会话专有：`streaming session must carry an empty body: got N bytes` | 会话作业带了非空 body | 否 |
 | 会话专有：`streaming session must carry an empty body: Spec.Session is false` | 会话端点收到未置 `Session` 的 Spec | 否 |
-| 传输/上游失败（连接、TLS、上游异常） | 一旦进入执行（序号已分配）即签发回执而非 error 帧：无字节产出 → `failed`；中途断流 → `truncated` | 是（已消耗，但以回执记账） |
+| 传输/上游失败（连接、TLS、上游异常） | 一旦进入执行（序号已分配）即签发回执而非 error 帧：无字节产出 → `failed`；中途断流 → `truncated`。回执之前另有 `failure` 帧说明原因（见 4.2(b)） | 是（已消耗，但以回执记账） |
 
 会话首帧解析失败时，TEE 以 Text 控制消息返回，例如 `{"error":"first frame must be binary"}`、`{"error":"decode session request: …"}`；30 秒内未收到首帧则以策略违规关闭连接。
 
