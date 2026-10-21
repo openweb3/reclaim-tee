@@ -2,7 +2,7 @@ module github.com/reclaimprotocol/reclaim-tee
 
 go 1.27
 
-toolchain go1.27.0
+toolchain go1.27.3
 
 require (
 	cloud.google.com/go/firestore v1.25.0
